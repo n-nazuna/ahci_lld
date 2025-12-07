@@ -40,3 +40,6 @@ core.*
 
 # Temporary files
 *.tmp
+
+# Documentation PDFs (large files)
+*.pdf
