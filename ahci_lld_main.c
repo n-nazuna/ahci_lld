@@ -12,7 +12,9 @@
 #include <linux/device.h>
 #include <linux/slab.h>
 #include <linux/io.h>
+#include <linux/uaccess.h>
 #include "ahci_lld.h"
+#include "ahci_lld_ioctl.h"
 
 static int ahci_lld_major = 0;
 static struct class *ahci_lld_class = NULL;
@@ -62,8 +64,45 @@ static ssize_t ahci_lld_write(struct file *file, const char __user *buf,
 static long ahci_lld_ioctl(struct file *file, unsigned int cmd,
                             unsigned long arg)
 {
-    /* 将来実装予定 */
-    return -ENOTTY;
+    struct ahci_port_device *port_dev = file->private_data;
+    int ret = 0;
+    
+    switch (cmd) {
+    /* Port Manipulation */
+    case AHCI_IOC_PORT_RESET:
+        dev_info(port_dev->device, "IOCTL: Port Reset\n");
+        ret = ahci_port_comreset(port_dev);
+        break;
+        
+    case AHCI_IOC_PORT_START:
+        dev_info(port_dev->device, "IOCTL: Port Start\n");
+        ret = ahci_port_start(port_dev);
+        break;
+        
+    case AHCI_IOC_PORT_STOP:
+        dev_info(port_dev->device, "IOCTL: Port Stop\n");
+        ret = ahci_port_stop(port_dev);
+        break;
+    
+    /* Command Issue */
+    case AHCI_IOC_ISSUE_CMD:
+        dev_info(port_dev->device, "IOCTL: Issue Command (not implemented)\n");
+        ret = -ENOSYS;
+        break;
+    
+    /* Read Dump */
+    case AHCI_IOC_READ_REGS:
+        dev_info(port_dev->device, "IOCTL: Read Port Registers (not implemented)\n");
+        ret = -ENOSYS;
+        break;
+    
+    default:
+        dev_warn(port_dev->device, "IOCTL: Unknown command 0x%x\n", cmd);
+        ret = -ENOTTY;
+        break;
+    }
+    
+    return ret;
 }
 
 static struct file_operations ahci_lld_fops = {
