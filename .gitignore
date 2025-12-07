@@ -1,0 +1,42 @@
+# Kernel module build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+.*.cmd
+.tmp_versions/
+Module.symvers
+modules.order
+
+# Hidden files from build system
+.module-common.o
+.modules.order.cmd
+.Module.symvers.cmd
+
+# Test binaries
+test_ioctl
+test_port_reset
+test_port_start_stop
+test_identify
+test_read_dma
+test_rw_1m
+
+# Backup files
+*~
+*.bak
+*.swp
+*.swo
+*_old.c
+*_backup.c
+
+# Editor files
+.vscode/
+.idea/
+*.sublime-*
+
+# Core dumps
+core
+core.*
+
+# Temporary files
+*.tmp
