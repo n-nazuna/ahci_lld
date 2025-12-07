@@ -15,6 +15,7 @@
 #include <linux/uaccess.h>
 #include "ahci_lld.h"
 #include "ahci_lld_ioctl.h"
+#include "ahci_lld_fis.h"
 
 static int ahci_lld_major = 0;
 static struct class *ahci_lld_class = NULL;
@@ -86,9 +87,54 @@ static long ahci_lld_ioctl(struct file *file, unsigned int cmd,
     
     /* Command Issue */
     case AHCI_IOC_ISSUE_CMD:
-        dev_info(port_dev->device, "IOCTL: Issue Command (not implemented)\n");
-        ret = -ENOSYS;
+    {
+        struct ahci_cmd_request req;
+        
+        dev_info(port_dev->device, "IOCTL: Issue Command\n");
+        
+        /* ユーザー空間から引数をコピー */
+        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
+            dev_err(port_dev->device, "Failed to copy command request from user\n");
+            ret = -EFAULT;
+            break;
+        }
+        
+        dev_info(port_dev->device, "Command: 0x%02x, buffer size: %u\n",
+                 req.command, req.buffer_len);
+        
+        /* IDENTIFY DEVICEのみサポート */
+        if (req.command == ATA_CMD_IDENTIFY_DEVICE) {
+            u8 *identify_buf;
+            
+            if (req.buffer_len < 512) {
+                dev_err(port_dev->device, "Buffer too small for IDENTIFY (need 512 bytes)\n");
+                ret = -EINVAL;
+                break;
+            }
+            
+            identify_buf = kmalloc(512, GFP_KERNEL);
+            if (!identify_buf) {
+                ret = -ENOMEM;
+                break;
+            }
+            
+            /* IDENTIFY DEVICE コマンド発行 */
+            ret = ahci_port_issue_identify(port_dev, identify_buf);
+            if (ret == 0) {
+                /* 結果をユーザー空間にコピー */
+                if (copy_to_user((void __user *)req.buffer, identify_buf, 512)) {
+                    dev_err(port_dev->device, "Failed to copy result to user\n");
+                    ret = -EFAULT;
+                }
+            }
+            
+            kfree(identify_buf);
+        } else {
+            dev_err(port_dev->device, "Unsupported command: 0x%02x\n", req.command);
+            ret = -EINVAL;
+        }
         break;
+    }
     
     /* Read Dump */
     case AHCI_IOC_READ_REGS:
@@ -241,6 +287,29 @@ static int ahci_create_port_device(struct ahci_hba *hba, int port_no)
     
     hba->ports[port_no] = port_dev;
     
+    /* DMAバッファの割り当て */
+    ret = ahci_port_alloc_dma_buffers(port_dev);
+    if (ret) {
+        dev_err(&hba->pdev->dev, "Failed to allocate DMA buffers for port %d\n", port_no);
+        device_destroy(ahci_lld_class, port_dev->devno);
+        cdev_del(&port_dev->cdev);
+        kfree(port_dev);
+        hba->ports[port_no] = NULL;
+        return ret;
+    }
+    
+    /* DMAアドレスをポートレジスタに設定 */
+    ret = ahci_port_setup_dma(port_dev);
+    if (ret) {
+        dev_err(&hba->pdev->dev, "Failed to setup DMA for port %d\n", port_no);
+        ahci_port_free_dma_buffers(port_dev);
+        device_destroy(ahci_lld_class, port_dev->devno);
+        cdev_del(&port_dev->cdev);
+        kfree(port_dev);
+        hba->ports[port_no] = NULL;
+        return ret;
+    }
+    
     pr_info("ahci_lld: Created device for port %d\n", port_no);
     return 0;
 }
@@ -252,6 +321,9 @@ static void ahci_destroy_port_device(struct ahci_hba *hba, int port_no)
     
     if (!port_dev)
         return;
+    
+    /* DMAバッファの解放 */
+    ahci_port_free_dma_buffers(port_dev);
     
     device_destroy(ahci_lld_class, port_dev->devno);
     cdev_del(&port_dev->cdev);

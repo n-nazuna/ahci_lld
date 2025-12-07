@@ -1,6 +1,6 @@
 obj-m += ahci_lld.o
 
-ahci_lld-objs := ahci_lld_main.o ahci_lld_hba.o ahci_lld_port.o ahci_lld_util.o
+ahci_lld-objs := ahci_lld_main.o ahci_lld_hba.o ahci_lld_port.o ahci_lld_util.o ahci_lld_buffer.o ahci_lld_cmd.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
