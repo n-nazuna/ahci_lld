@@ -75,6 +75,93 @@ static struct file_operations ahci_lld_fops = {
     .unlocked_ioctl = ahci_lld_ioctl,
 };
 
+/* GHCデバイスのファイルオペレーション */
+static int ahci_ghc_open(struct inode *inode, struct file *file)
+{
+    struct ahci_ghc_device *ghc_dev;
+    
+    ghc_dev = container_of(inode->i_cdev, struct ahci_ghc_device, cdev);
+    file->private_data = ghc_dev;
+    
+    pr_info("ahci_lld: opened GHC device\n");
+    return 0;
+}
+
+static int ahci_ghc_release(struct inode *inode, struct file *file)
+{
+    pr_info("ahci_lld: closed GHC device\n");
+    return 0;
+}
+
+static ssize_t ahci_ghc_read(struct file *file, char __user *buf,
+                              size_t count, loff_t *ppos)
+{
+    struct ahci_ghc_device *ghc_dev = file->private_data;
+    u32 reg_val;
+    
+    /* オフセットをチェック（GHCレジスタ領域のみアクセス可能） */
+    if (*ppos < 0 || *ppos >= 0x100)  /* Generic Host Control は 0x00-0x2C */
+        return -EINVAL;
+    
+    if (count != 4)  /* 32ビットレジスタのみ */
+        return -EINVAL;
+    
+    reg_val = ioread32(ghc_dev->mmio + *ppos);
+    
+    if (copy_to_user(buf, &reg_val, 4))
+        return -EFAULT;
+    
+    return 4;
+}
+
+static ssize_t ahci_ghc_write(struct file *file, const char __user *buf,
+                               size_t count, loff_t *ppos)
+{
+    struct ahci_ghc_device *ghc_dev = file->private_data;
+    u32 reg_val;
+    
+    /* オフセットをチェック */
+    if (*ppos < 0 || *ppos >= 0x100)
+        return -EINVAL;
+    
+    if (count != 4)
+        return -EINVAL;
+    
+    /* 読み取り専用レジスタへの書き込みを防ぐ */
+    if (*ppos == AHCI_CAP || *ppos == AHCI_PI || 
+        *ppos == AHCI_VS || *ppos == AHCI_CAP2) {
+        dev_warn(&ghc_dev->hba->pdev->dev, 
+                 "Attempted write to read-only register at offset 0x%llx\n", *ppos);
+        return -EPERM;
+    }
+    
+    if (copy_from_user(&reg_val, buf, 4))
+        return -EFAULT;
+    
+    iowrite32(reg_val, ghc_dev->mmio + *ppos);
+    
+    dev_info(&ghc_dev->hba->pdev->dev, 
+             "GHC write: offset=0x%llx, value=0x%08x\n", *ppos, reg_val);
+    
+    return 4;
+}
+
+static long ahci_ghc_ioctl(struct file *file, unsigned int cmd,
+                            unsigned long arg)
+{
+    /* 将来的にHBAリセットなどの特殊操作を実装 */
+    return -ENOTTY;
+}
+
+static struct file_operations ahci_ghc_fops = {
+    .owner = THIS_MODULE,
+    .open = ahci_ghc_open,
+    .release = ahci_ghc_release,
+    .read = ahci_ghc_read,
+    .write = ahci_ghc_write,
+    .unlocked_ioctl = ahci_ghc_ioctl,
+};
+
 /* ポートデバイスの作成 */
 static int ahci_create_port_device(struct ahci_hba *hba, int port_no)
 {
@@ -87,7 +174,7 @@ static int ahci_create_port_device(struct ahci_hba *hba, int port_no)
     
     port_dev->port_no = port_no;
     port_dev->hba = hba;
-    port_dev->port_mmio = hba->mmio + AHCI_PORT_BASE + (port_no * AHCI_PORT_SIZE);
+    port_dev->port_mmio = hba->mmio + AHCI_PORT_OFFSET(port_no);
     port_dev->devno = MKDEV(ahci_lld_major, port_no);
     
     /* cdev初期化と追加 */
@@ -133,6 +220,64 @@ static void ahci_destroy_port_device(struct ahci_hba *hba, int port_no)
     hba->ports[port_no] = NULL;
     
     pr_info("ahci_lld: Destroyed device for port %d\n", port_no);
+}
+
+/* GHCデバイスの作成 */
+static int ahci_create_ghc_device(struct ahci_hba *hba)
+{
+    struct ahci_ghc_device *ghc_dev;
+    int ret;
+    
+    ghc_dev = kzalloc(sizeof(*ghc_dev), GFP_KERNEL);
+    if (!ghc_dev)
+        return -ENOMEM;
+    
+    ghc_dev->hba = hba;
+    ghc_dev->mmio = hba->mmio;
+    ghc_dev->devno = MKDEV(ahci_lld_major, AHCI_MAX_PORTS);  /* ポート番号の後 */
+    
+    /* cdev初期化と追加 */
+    cdev_init(&ghc_dev->cdev, &ahci_ghc_fops);
+    ghc_dev->cdev.owner = THIS_MODULE;
+    
+    ret = cdev_add(&ghc_dev->cdev, ghc_dev->devno, 1);
+    if (ret) {
+        dev_err(&hba->pdev->dev, "Failed to add cdev for GHC device\n");
+        kfree(ghc_dev);
+        return ret;
+    }
+    
+    /* デバイスノード作成 */
+    ghc_dev->device = device_create(ahci_lld_class, &hba->pdev->dev,
+                                     ghc_dev->devno, NULL, "ahci_lld_ghc");
+    if (IS_ERR(ghc_dev->device)) {
+        ret = PTR_ERR(ghc_dev->device);
+        dev_err(&hba->pdev->dev, "Failed to create GHC device\n");
+        cdev_del(&ghc_dev->cdev);
+        kfree(ghc_dev);
+        return ret;
+    }
+    
+    hba->ghc_dev = ghc_dev;
+    
+    pr_info("ahci_lld: Created GHC control device\n");
+    return 0;
+}
+
+/* GHCデバイスの破棄 */
+static void ahci_destroy_ghc_device(struct ahci_hba *hba)
+{
+    struct ahci_ghc_device *ghc_dev = hba->ghc_dev;
+    
+    if (!ghc_dev)
+        return;
+    
+    device_destroy(ahci_lld_class, ghc_dev->devno);
+    cdev_del(&ghc_dev->cdev);
+    kfree(ghc_dev);
+    hba->ghc_dev = NULL;
+    
+    pr_info("ahci_lld: Destroyed GHC control device\n");
 }
 
 /* PCIプローブ */
@@ -196,6 +341,13 @@ static int ahci_lld_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
     
     dev_info(&pdev->dev, "Ports Implemented: 0x%08x\n", ports_impl);
     
+    /* GHC制御デバイスを作成 */
+    ret = ahci_create_ghc_device(hba);
+    if (ret) {
+        dev_err(&pdev->dev, "Failed to create GHC device\n");
+        goto err_unmap;
+    }
+    
     /* 実装されているポートごとにキャラクタデバイスを作成 */
     for (i = 0; i < AHCI_MAX_PORTS; i++) {
         if (!(ports_impl & (1 << i)))
@@ -219,6 +371,7 @@ err_cleanup_ports:
         if (hba->ports[i])
             ahci_destroy_port_device(hba, i);
     }
+    ahci_destroy_ghc_device(hba);
 err_unmap:
     pci_iounmap(pdev, hba->mmio);
 err_release_regions:
@@ -237,6 +390,9 @@ static void ahci_lld_remove(struct pci_dev *pdev)
     int i;
     
     dev_info(&pdev->dev, "AHCI LLD remove start\n");
+    
+    /* GHCデバイスを破棄 */
+    ahci_destroy_ghc_device(hba);
     
     /* 全ポートデバイスを破棄 */
     for (i = 0; i < AHCI_MAX_PORTS; i++) {
@@ -271,8 +427,8 @@ static int __init ahci_lld_init(void)
     
     pr_info("ahci_lld: Initializing AHCI Low Level Driver\n");
     
-    /* キャラクタデバイス番号の割り当て */
-    ret = alloc_chrdev_region(&dev, 0, AHCI_MAX_PORTS, DRIVER_NAME);
+    /* キャラクタデバイス番号の割り当て (ポート用 + GHC用) */
+    ret = alloc_chrdev_region(&dev, 0, AHCI_MAX_PORTS + 1, DRIVER_NAME);
     if (ret < 0) {
         pr_err("ahci_lld: Failed to allocate chrdev region\n");
         return ret;

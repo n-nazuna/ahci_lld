@@ -4,6 +4,15 @@
 
 AHCI Low Level Driverは、AHCIコントローラーの各ポートを独立したキャラクタデバイスとして公開するLinux kernelドライバーです。従来のブロックデバイスとしてではなく、キャラクタデバイスとして実装することで、ポートレベルでの直接的な制御を可能にします。
 
+また、HBA全体の制御用に `/dev/ahci_lld_ghc` デバイスを提供し、Global HBA Control (GHC) レジスタへの直接アクセスを可能にします。
+
+## 特徴
+
+- **ポート単位のデバイス**: 各AHCIポートが独立した `/dev/ahci_lld_pN` デバイスとして公開
+- **GHC制御デバイス**: `/dev/ahci_lld_ghc` でHBA全体のレジスタ操作が可能
+- **AHCI仕様準拠**: AHCI 1.3.1仕様に基づいたポート初期化・クリーンアップ
+- **共通ユーティリティ**: レジスタポーリングなどの共通処理を関数化
+
 ## アーキテクチャ
 
 ```mermaid
@@ -16,10 +25,13 @@ graph TB
         DEV0["Device: /dev/ahci_lld_p0"]
         DEV1["Device: /dev/ahci_lld_p1"]
         DEV2["Device: /dev/ahci_lld_p2"]
+        DEVGHC["Device: /dev/ahci_lld_ghc<br/>GHC Control"]
         
         MAIN["ahci_lld_main.c<br/>PCI & Device Management"]
         HBA["ahci_lld_hba.c<br/>HBA Operations"]
         PORT["ahci_lld_port.c<br/>Port Operations"]
+        UTIL["ahci_lld_util.c<br/>Common Utilities"]
+        REG["ahci_lld_reg.h<br/>Register Definitions"]
         
         HEADER["ahci_lld.h<br/>Common Definitions"]
     end
@@ -34,16 +46,21 @@ graph TB
     APP -->|open/read/write/ioctl| DEV0
     APP -->|open/read/write/ioctl| DEV1
     APP -->|open/read/write/ioctl| DEV2
+    APP -->|read/write GHC regs| DEVGHC
     
     DEV0 --> MAIN
     DEV1 --> MAIN
     DEV2 --> MAIN
+    DEVGHC --> MAIN
     
     MAIN --> HBA
     MAIN --> PORT
+    HBA --> UTIL
+    PORT --> UTIL
     HBA --> HEADER
     PORT --> HEADER
     MAIN --> HEADER
+    HEADER --> REG
     
     MAIN -->|PCI Access| PCI
     HBA -->|Configure / Reset| PCI
@@ -61,21 +78,26 @@ graph TB
 ```
 ahci_lld/
 ├── ahci_lld.h              # 共通ヘッダーファイル
+├── ahci_lld_reg.h          # AHCIレジスタ定義
 ├── ahci_lld_main.c         # メインモジュール（PCI、デバイス管理）
 ├── ahci_lld_hba.c          # HBA操作モジュール
 ├── ahci_lld_port.c         # ポート操作モジュール
+├── ahci_lld_util.c         # 共通ユーティリティ関数
 ├── ahci_lld_buffer.c       # DMAバッファ管理（未実装）
 ├── Makefile                # ビルド設定
-└── README.md               # このファイル
+├── README.md               # このファイル
+└── serial-ata-ahci-spec-rev1-3-1-3.pdf  # AHCI 1.3.1仕様書
 ```
 
 ### モジュール間の責務分離
 
 | モジュール | 責務 |
 |-----------|------|
-| `ahci_lld_main.c` | PCIデバイスの検出・登録、キャラクタデバイスの作成・管理、ドライバーのライフサイクル管理 |
+| `ahci_lld_main.c` | PCIデバイスの検出・登録、キャラクタデバイスの作成・管理、ドライバーのライフサイクル管理、GHCデバイスの実装 |
 | `ahci_lld_hba.c` | HBAレベルの操作（リセット、AHCI有効化、グローバル設定） |
 | `ahci_lld_port.c` | ポートレベルの操作（初期化、クリーンアップ、コマンド実行） |
+| `ahci_lld_util.c` | 共通ユーティリティ関数（レジスタポーリング、タイムアウト処理） |
+| `ahci_lld_reg.h` | AHCIレジスタ定義（オフセット、ビットマスク、定数） |
 | `ahci_lld_buffer.c` | Data IO用DMAバッファの割り当て・管理（将来実装予定） |
 
 ## データ構造
@@ -94,6 +116,7 @@ struct ahci_hba {
     int n_ports;                               // 実装されているポート数
     
     struct ahci_port_device *ports[AHCI_MAX_PORTS];  // ポートデバイスの配列
+    struct ahci_ghc_device *ghc_dev;           // GHC制御デバイス
     
     dev_t dev_base;                            // デバイス番号のベース
     struct class *class;                       // デバイスクラス
@@ -111,6 +134,20 @@ struct ahci_port_device {
     dev_t devno;                               // デバイス番号
     int port_no;                               // ポート番号
     void __iomem *port_mmio;                   // ポートMMIO領域
+    struct ahci_hba *hba;                      // 親HBA構造体へのポインタ
+};
+```
+
+### `struct ahci_ghc_device`
+
+GHC (Global HBA Control) 制御用デバイスの情報を管理する構造体。
+
+```c
+struct ahci_ghc_device {
+    struct cdev cdev;                          // キャラクタデバイス
+    struct device *device;                     // デバイスオブジェクト
+    dev_t devno;                               // デバイス番号
+    void __iomem *mmio;                        // HBA全体のMMIO領域
     struct ahci_hba *hba;                      // 親HBA構造体へのポインタ
 };
 ```
@@ -366,15 +403,14 @@ int ahci_hba_enable(struct ahci_hba *hba)
 ```c
 int ahci_port_init(struct ahci_port_device *port)
 ```
-**役割**: ポートの初期化処理（将来実装予定）  
-**予定処理内容**:
-1. PxCMD.ST/FRE がクリアされていることを確認
-2. Command List Base Address (PxCLB/PxCLBU) の設定
-3. FIS Base Address (PxFB/PxFBU) の設定
-4. PxSERR (Port x SATA Error) レジスタのクリア
-5. PxIS (Port x Interrupt Status) レジスタのクリア
-6. PxCMD.FRE (FIS Receive Enable) の有効化
-7. PxCMD.ST (Start) の有効化
+**役割**: AHCI仕様書 Section 10.3.1 に従ってポートを初期化  
+**処理内容**:
+1. PxCMD.ST, CR, FRE, FR が全て0（アイドル状態）であることを確認
+2. 必要に応じてポートを停止し、CRとFRのクリアを待機
+3. PxSSTSでデバイス接続状態を確認
+4. PxSERRをクリア（DIAG.Xを含む）
+5. PxCMD.FREを有効化してFIS受信を開始
+6. 割り込みを有効化（DHRS, ERROR, PCS, PRCS）
 
 **仕様準拠**: AHCI仕様 Section 10.3 Port Initialization
 
@@ -383,9 +419,14 @@ int ahci_port_init(struct ahci_port_device *port)
 
 **返り値**:
 - `0`: 成功
-- 負の値: エラーコード（将来実装）
+- `-ETIMEDOUT`: タイムアウト
 
-**現在の実装**: ログ出力のみ
+**レジスタ操作**:
+- `PxCMD`: ST, FRE, CR, FRビットの制御
+- `PxSSTS`: デバイス検出状態の確認
+- `PxSERR`: エラーレジスタのクリア
+- `PxIE`: 割り込み有効化
+- `PxIS`: 割り込みステータスのクリア
 
 ---
 
@@ -393,20 +434,105 @@ int ahci_port_init(struct ahci_port_device *port)
 ```c
 void ahci_port_cleanup(struct ahci_port_device *port)
 ```
-**役割**: ポートのクリーンアップ処理（将来実装予定）  
-**予定処理内容**:
-1. PxCMD.ST (Start) のクリア
-2. PxCMD.CR (Command List Running) がクリアされるまで待機
-3. PxCMD.FRE (FIS Receive Enable) のクリア
-4. PxCMD.FR (FIS Receive Running) がクリアされるまで待機
-5. DMAバッファの解放
-
-**仕様準拠**: AHCI仕様 Section 10.3.2 Port Stop
+**役割**: AHCI仕様書 Section 10.3 に従ってポートを停止  
+**処理内容**:
+1. 割り込みを無効化
+2. PxISをクリア
+3. PxCMD.STをクリアし、CRのクリアを待機
+4. PxCMD.FREをクリアし、FRのクリアを待機
 
 **引数**:
 - `port`: ポートデバイス構造体
 
-**現在の実装**: ログ出力のみ
+**レジスタ操作**:
+- `PxIE`: 割り込み無効化
+- `PxIS`: 割り込みステータスクリア
+- `PxCMD`: ST, FREビットのクリアとCR, FRの待機
+
+---
+
+### ahci_lld_util.c
+
+#### 共通ユーティリティ関数
+
+##### `ahci_wait_bit_clear()`
+```c
+int ahci_wait_bit_clear(void __iomem *mmio, u32 reg, u32 mask,
+                        int timeout_ms, struct device *dev, const char *bit_name)
+```
+**役割**: レジスタの指定ビットがクリアされるまでポーリング  
+**処理内容**:
+1. タイムアウトするまで1msごとにレジスタを読み取り
+2. 指定ビットがクリアされたら成功
+3. タイムアウト時はエラーログを出力
+
+**パラメータ**:
+- `mmio`: MMIOベースアドレス
+- `reg`: レジスタオフセット
+- `mask`: 監視するビットマスク
+- `timeout_ms`: タイムアウト時間（ミリ秒）
+- `dev`: デバイス構造体（ログ用、NULLも可）
+- `bit_name`: ビット名（ログ用、NULLも可）
+
+**返り値**:
+- `0`: 成功
+- `-ETIMEDOUT`: タイムアウト
+
+---
+
+##### `ahci_wait_bit_set()`
+```c
+int ahci_wait_bit_set(void __iomem *mmio, u32 reg, u32 mask,
+                      int timeout_ms, struct device *dev, const char *bit_name)
+```
+**役割**: レジスタの指定ビットがセットされるまでポーリング  
+**処理内容**: `ahci_wait_bit_clear()` と同様だが、ビットのセットを待機
+
+**パラメータ**: `ahci_wait_bit_clear()` と同じ
+
+**返り値**:
+- `0`: 成功
+- `-ETIMEDOUT`: タイムアウト
+
+---
+
+## デバイスインターフェース
+
+### ポートデバイス (`/dev/ahci_lld_pN`)
+
+各AHCIポート用のキャラクタデバイス（N = 0〜31）
+
+**現在の実装**:
+- `open()`: ポートデバイスをオープン
+- `release()`: ポートデバイスをクローズ
+- `read()`: 未実装
+- `write()`: 未実装
+- `ioctl()`: 未実装
+
+### GHCデバイス (`/dev/ahci_lld_ghc`)
+
+HBA全体の制御用デバイス
+
+**実装機能**:
+- `open()`: GHCデバイスをオープン
+- `release()`: GHCデバイスをクローズ
+- `read()`: Generic Host Control領域（0x00-0xFF）のレジスタ読み取り
+  - 4バイト単位でレジスタ値を読み取り
+  - `lseek()`でオフセット指定可能
+- `write()`: レジスタへの書き込み
+  - 4バイト単位でレジスタ値を書き込み
+  - 読み取り専用レジスタ（CAP, PI, VS, CAP2）への書き込みは拒否
+  - `lseek()`でオフセット指定可能
+- `ioctl()`: 未実装（将来的にHBAリセットなどの特殊操作を実装予定）
+
+**使用例**:
+```bash
+# CAPレジスタ（offset 0x00）を読み取り
+sudo dd if=/dev/ahci_lld_ghc bs=4 count=1 skip=0 | xxd
+
+# GHCレジスタ（offset 0x04）を読み取り
+sudo dd if=/dev/ahci_lld_ghc bs=4 count=1 skip=1 | xxd
+```
 
 ---
 
