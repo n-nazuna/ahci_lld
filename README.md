@@ -10,8 +10,12 @@ AHCI Low Level Driverは、AHCIコントローラーの各ポートを独立し�
 
 - **ポート単位のデバイス**: 各AHCIポートが独立した `/dev/ahci_lld_pN` デバイスとして公開
 - **GHC制御デバイス**: `/dev/ahci_lld_ghc` でHBA全体のレジスタ操作が可能
-- **AHCI仕様準拠**: AHCI 1.3.1仕様に基づいたポート初期化・クリーンアップ
+- **AHCI仕様準拠**: AHCI 1.3.1仕様に基づいた実装
+  - ポート初期化・クリーンアップ (Section 10.3)
+  - COMRESET実装 (Section 10.4.2)
+  - ポート停止・開始 (Section 10.3.1, 10.3.2)
 - **共通ユーティリティ**: レジスタポーリングなどの共通処理を関数化
+- **IOCTL API**: ユーザー空間からのポート制御インターフェース
 
 ## アーキテクチャ
 
@@ -79,11 +83,13 @@ graph TB
 ahci_lld/
 ├── ahci_lld.h              # 共通ヘッダーファイル
 ├── ahci_lld_reg.h          # AHCIレジスタ定義
+├── ahci_lld_ioctl.h        # IOCTL定義（ユーザー空間共有用）
 ├── ahci_lld_main.c         # メインモジュール（PCI、デバイス管理）
 ├── ahci_lld_hba.c          # HBA操作モジュール
 ├── ahci_lld_port.c         # ポート操作モジュール
 ├── ahci_lld_util.c         # 共通ユーティリティ関数
 ├── ahci_lld_buffer.c       # DMAバッファ管理（未実装）
+├── test_port_start_stop.c  # ポート制御テストプログラム
 ├── Makefile                # ビルド設定
 ├── README.md               # このファイル
 └── serial-ata-ahci-spec-rev1-3-1-3.pdf  # AHCI 1.3.1仕様書
@@ -93,11 +99,12 @@ ahci_lld/
 
 | モジュール | 責務 |
 |-----------|------|
-| `ahci_lld_main.c` | PCIデバイスの検出・登録、キャラクタデバイスの作成・管理、ドライバーのライフサイクル管理、GHCデバイスの実装 |
+| `ahci_lld_main.c` | PCIデバイスの検出・登録、キャラクタデバイスの作成・管理、ドライバーのライフサイクル管理、GHCデバイスの実装、IOCTLハンドラ |
 | `ahci_lld_hba.c` | HBAレベルの操作（リセット、AHCI有効化、グローバル設定） |
-| `ahci_lld_port.c` | ポートレベルの操作（初期化、クリーンアップ、コマンド実行） |
+| `ahci_lld_port.c` | ポートレベルの操作（初期化、クリーンアップ、COMRESET、停止、開始） |
 | `ahci_lld_util.c` | 共通ユーティリティ関数（レジスタポーリング、タイムアウト処理） |
 | `ahci_lld_reg.h` | AHCIレジスタ定義（オフセット、ビットマスク、定数） |
+| `ahci_lld_ioctl.h` | IOCTL定義とデータ構造（ユーザー空間とカーネル空間で共有） |
 | `ahci_lld_buffer.c` | Data IO用DMAバッファの割り当て・管理（将来実装予定） |
 
 ## データ構造
@@ -446,8 +453,96 @@ void ahci_port_cleanup(struct ahci_port_device *port)
 
 **レジスタ操作**:
 - `PxIE`: 割り込み無効化
-- `PxIS`: 割り込みステータスクリア
-- `PxCMD`: ST, FREビットのクリアとCR, FRの待機
+- `PxIS`: 割り込みステータスのクリア
+- `PxCMD`: ST, FREビットのクリア、CR, FRのクリア待機
+
+---
+
+##### `ahci_port_comreset()`
+```c
+int ahci_port_comreset(struct ahci_port_device *port)
+```
+**役割**: AHCI仕様書 Section 10.4.2 に従ってCOMRESETを実行  
+**処理内容**:
+1. ポートが動作中の場合は停止
+2. PxSCTL.DET = 1 (COMRESET開始)
+3. 10ms待機
+4. PxSCTL.DET = 0 (COMRESET解除)
+5. PxSSTS.DET = 3 (PHY確立) まで待機 (最大1000ms)
+6. PxSERRをクリア
+
+**仕様準拠**: AHCI仕様 Section 10.4.2 Port Reset
+
+**引数**:
+- `port`: ポートデバイス構造体
+
+**返り値**:
+- `0`: 成功
+- 負の値: エラーコード
+
+**タイミング**: 
+- COMRESET保持時間: 10ms
+- PHY確立待機: 最大1000ms
+
+**レジスタ操作**:
+- `PxSCTL`: DETフィールド (bit 3-0) の操作
+- `PxSSTS`: DETフィールド (bit 3-0) の確認
+- `PxSERR`: エラーレジスタのクリア
+
+---
+
+##### `ahci_port_stop()`
+```c
+int ahci_port_stop(struct ahci_port_device *port)
+```
+**役割**: AHCI仕様書 Section 10.3.2 に従ってポートを停止  
+**処理内容**:
+1. PxCMD.STをクリア
+2. PxCMD.CRのクリアを待機 (最大500ms)
+3. オプション: PxCMD.FREをクリアしてFIS受信を停止
+4. オプション: PxCMD.FRのクリアを待機 (最大500ms)
+
+**仕様準拠**: AHCI仕様 Section 10.3.2 System Software Specific Initialization
+
+**引数**:
+- `port`: ポートデバイス構造体
+
+**返り値**:
+- `0`: 成功
+- `-ETIMEDOUT`: タイムアウト
+
+**レジスタ操作**:
+- `PxCMD`: ST, FREビットのクリア、CR, FRビットの確認
+
+---
+
+##### `ahci_port_start()`
+```c
+int ahci_port_start(struct ahci_port_device *port)
+```
+**役割**: AHCI仕様書 Section 10.3.1 に従ってポートを開始  
+**処理内容**:
+1. PxSSTSでデバイス接続を確認
+2. PxCMD.FREを有効化してFIS受信を開始
+3. PxCMD.FRの立ち上がりを待機 (最大500ms)
+4. PxISをクリア
+5. PxCMD.STを有効化してコマンド処理を開始
+
+**前提条件**: PxCLB/PxFBが設定済みであること
+
+**仕様準拠**: AHCI仕様 Section 10.3.1 System Software Specific Initialization
+
+**引数**:
+- `port`: ポートデバイス構造体
+
+**返り値**:
+- `0`: 成功
+- `-ETIMEDOUT`: タイムアウト
+
+**レジスタ操作**:
+- `PxSSTS`: デバイス検出状態の確認
+- `PxCMD`: FRE, STビットの設定、FRビットの確認
+- `PxIS`: 割り込みステータスのクリア
 
 ---
 
@@ -505,9 +600,14 @@ int ahci_wait_bit_set(void __iomem *mmio, u32 reg, u32 mask,
 **現在の実装**:
 - `open()`: ポートデバイスをオープン
 - `release()`: ポートデバイスをクローズ
+- `ioctl()`: ポート制御コマンド
+  - `AHCI_IOC_PORT_RESET`: COMRESETによるポートリセット
+  - `AHCI_IOC_PORT_START`: ポート開始（FIS受信/コマンド処理有効化）
+  - `AHCI_IOC_PORT_STOP`: ポート停止
+  - `AHCI_IOC_ISSUE_CMD`: コマンド発行（未実装）
+  - `AHCI_IOC_READ_REGS`: レジスタダンプ取得（未実装）
 - `read()`: 未実装
 - `write()`: 未実装
-- `ioctl()`: 未実装
 
 ### GHCデバイス (`/dev/ahci_lld_ghc`)
 
@@ -618,12 +718,77 @@ dmesg | tail
 lspci -k -s 00:17.0
 ```
 
-### 4. デバイスのオープン（テスト）
+### 4. ポート操作のテスト
 
 ```bash
-# ポート0を開く（rootまたは適切な権限が必要）
-sudo cat /dev/ahci_lld_p0
+# テストプログラムのコンパイル
+gcc -o test_port_start_stop test_port_start_stop.c
+
+# テストの実行（PORT_START → PORT_STOP → PORT_RESET → PORT_START）
+sudo ./test_port_start_stop
+
+# カーネルログで詳細を確認
+sudo dmesg | tail -40
 ```
+
+## IOCTL API
+
+### ポート制御コマンド
+
+ユーザー空間から `ioctl()` を使用してポートを制御できます。
+
+#### `AHCI_IOC_PORT_RESET` (0x4101)
+**機能**: COMRESETによるポートリセット  
+**引数**: なし  
+**戻り値**: 成功時 0、失敗時 -1
+
+```c
+int fd = open("/dev/ahci_lld_p0", O_RDWR);
+if (ioctl(fd, AHCI_IOC_PORT_RESET) < 0) {
+    perror("PORT_RESET failed");
+}
+close(fd);
+```
+
+#### `AHCI_IOC_PORT_START` (0x4102)
+**機能**: ポートの開始（FIS受信とコマンド処理を有効化）  
+**引数**: なし  
+**戻り値**: 成功時 0、失敗時 -1
+
+```c
+int fd = open("/dev/ahci_lld_p0", O_RDWR);
+if (ioctl(fd, AHCI_IOC_PORT_START) < 0) {
+    perror("PORT_START failed");
+}
+close(fd);
+```
+
+#### `AHCI_IOC_PORT_STOP` (0x4103)
+**機能**: ポートの停止  
+**引数**: なし  
+**戻り値**: 成功時 0、失敗時 -1
+
+```c
+int fd = open("/dev/ahci_lld_p0", O_RDWR);
+if (ioctl(fd, AHCI_IOC_PORT_STOP) < 0) {
+    perror("PORT_STOP failed");
+}
+close(fd);
+```
+
+#### `AHCI_IOC_ISSUE_CMD` (0xC0404110A)
+**機能**: AHCIコマンドの発行  
+**引数**: `struct ahci_cmd_request *`  
+**戻り値**: 成功時 0、失敗時 -1  
+**実装状況**: 未実装
+
+#### `AHCI_IOC_READ_REGS` (0x80484114)
+**機能**: ポートレジスタのダンプ取得  
+**引数**: `struct ahci_port_regs *`  
+**戻り値**: 成功時 0、失敗時 -1  
+**実装状況**: 未実装
+
+---
 
 ## 動作確認済み環境
 
@@ -634,14 +799,19 @@ sudo cat /dev/ahci_lld_p0
 ## 今後の実装予定
 
 ### 短期（フェーズ1）
+- [x] ポート初期化処理の実装 (AHCI 10.3.1準拠)
+- [x] ポートクリーンアップの実装 (AHCI 10.3準拠)
+- [x] COMRESET実装 (AHCI 10.4.2準拠)
+- [x] PORT_START/STOP実装 (AHCI 10.3.1/10.3.2準拠)
+- [x] IOCTLインターフェースの基本実装
+- [ ] READ_REGS ioctl実装
 - [ ] DMAバッファ管理の実装 (`ahci_lld_buffer.c`)
-- [ ] ポート初期化処理の実装
 - [ ] Command List / FIS 構造体の定義
 
 ### 中期（フェーズ2）
 - [ ] IDENTIFY DEVICE コマンドの実装
 - [ ] READ/WRITE コマンドの実装
-- [ ] ioctlインターフェースの設計・実装
+- [ ] ISSUE_CMD ioctl実装
 - [ ] エラーハンドリングの強化
 
 ### 長期（フェーズ3）

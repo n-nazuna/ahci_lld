@@ -59,11 +59,19 @@ int ahci_hba_enable(struct ahci_hba *hba);
 /* ahci_lld_port.c からエクスポートされる関数 */
 int ahci_port_init(struct ahci_port_device *port);
 void ahci_port_cleanup(struct ahci_port_device *port);
+int ahci_port_comreset(struct ahci_port_device *port);
 
 /* ahci_lld_util.c からエクスポートされる共通関数 */
 int ahci_wait_bit_clear(void __iomem *mmio, u32 reg, u32 mask,
                         int timeout_ms, struct device *dev, const char *bit_name);
 int ahci_wait_bit_set(void __iomem *mmio, u32 reg, u32 mask,
                       int timeout_ms, struct device *dev, const char *bit_name);
+
+/* ahci_lld_port.c からエクスポートされるポート操作関数 */
+void ahci_port_cleanup(struct ahci_port_device *port);
+int ahci_port_init(struct ahci_port_device *port);
+int ahci_port_comreset(struct ahci_port_device *port);
+int ahci_port_stop(struct ahci_port_device *port);
+int ahci_port_start(struct ahci_port_device *port);
 
 #endif /* AHCI_LLD_H */

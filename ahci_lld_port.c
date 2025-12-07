@@ -162,3 +162,220 @@ void ahci_port_cleanup(struct ahci_port_device *port)
              ioread32(port_mmio + AHCI_PORT_CMD));
 }
 EXPORT_SYMBOL_GPL(ahci_port_cleanup);
+
+/**
+ * ahci_port_comreset - ポートのCOMRESETを実行
+ * @port: ポートデバイス構造体
+ *
+ * AHCI仕様書 Section 10.4.2 に従ってCOMRESETを実行する
+ * 1. ポートを停止（PxCMD.ST=0, CR=0を確認）
+ * 2. PxSCTL.DETに1を書き込んでCOMRESET開始
+ * 3. 最低1msec待機
+ * 4. PxSCTL.DETに0を書き込んでCOMRESET終了
+ * 5. PHYの準備完了を待機（PxSSTS.DET=3）
+ * 6. PxSERRをクリア
+ *
+ * Return: 成功時0、失敗時負のエラーコード
+ */
+int ahci_port_comreset(struct ahci_port_device *port)
+{
+    void __iomem *port_mmio = port->port_mmio;
+    u32 cmd, sctl, ssts, serr;
+    int timeout;
+    
+    dev_info(port->device, "Performing COMRESET on port %d\n", port->port_no);
+    
+    /* Step 1: ポートが停止していることを確認 */
+    cmd = ioread32(port_mmio + AHCI_PORT_CMD);
+    if (cmd & AHCI_PORT_CMD_ST) {
+        dev_info(port->device, "Port is running, stopping first\n");
+        cmd &= ~AHCI_PORT_CMD_ST;
+        iowrite32(cmd, port_mmio + AHCI_PORT_CMD);
+        
+        /* PxCMD.CR がクリアされるまで待機 */
+        if (ahci_wait_bit_clear(port_mmio, AHCI_PORT_CMD,
+                                AHCI_PORT_CMD_CR, 500,
+                                port->device, "PxCMD.CR before COMRESET"))
+            return -ETIMEDOUT;
+    }
+    
+    /* Step 2: PxSCTL.DET = 1 (Perform interface communication initialization) */
+    sctl = ioread32(port_mmio + AHCI_PORT_SCTL);
+    sctl = (sctl & ~AHCI_PORT_SCTL_DET) | (1 << 0);  /* DET = 1 */
+    iowrite32(sctl, port_mmio + AHCI_PORT_SCTL);
+    
+    dev_info(port->device, "COMRESET initiated (PxSCTL=0x%08x)\n", sctl);
+    
+    /* Step 3: 最低1msec待機（仕様書では "at least 1 millisecond"） */
+    msleep(10);  /* 余裕を持って10ms待機 */
+    
+    /* Step 4: PxSCTL.DET = 0 (No device detection or initialization requested) */
+    sctl = ioread32(port_mmio + AHCI_PORT_SCTL);
+    sctl &= ~AHCI_PORT_SCTL_DET;  /* DET = 0 */
+    iowrite32(sctl, port_mmio + AHCI_PORT_SCTL);
+    
+    dev_info(port->device, "COMRESET deasserted (PxSCTL=0x%08x)\n", sctl);
+    
+    /* Step 5: PHYが準備完了するまで待機（PxSSTS.DET = 3: Device detected and Phy communication established） */
+    timeout = 1000;  /* 最大1秒待機 */
+    while (timeout > 0) {
+        ssts = ioread32(port_mmio + AHCI_PORT_SSTS);
+        if ((ssts & AHCI_PORT_SSTS_DET) == AHCI_PORT_DET_ESTABLISHED) {
+            dev_info(port->device, "PHY communication established (PxSSTS=0x%08x)\n", ssts);
+            break;
+        }
+        msleep(10);
+        timeout -= 10;
+    }
+    
+    ssts = ioread32(port_mmio + AHCI_PORT_SSTS);
+    if ((ssts & AHCI_PORT_SSTS_DET) != AHCI_PORT_DET_ESTABLISHED) {
+        dev_warn(port->device, "PHY communication not established after COMRESET (PxSSTS.DET=0x%x)\n",
+                 ssts & AHCI_PORT_SSTS_DET);
+        /* デバイスが接続されていない場合もあるので、これはエラーにしない */
+    }
+    
+    /* Step 6: PxSERR をクリア */
+    serr = ioread32(port_mmio + AHCI_PORT_SERR);
+    if (serr) {
+        dev_info(port->device, "Clearing PxSERR (0x%08x) after COMRESET\n", serr);
+        iowrite32(0xFFFFFFFF, port_mmio + AHCI_PORT_SERR);
+    }
+    
+    dev_info(port->device, "COMRESET complete\n");
+    
+    return 0;
+}
+EXPORT_SYMBOL_GPL(ahci_port_comreset);
+
+/**
+ * ahci_port_stop - ポートを停止する
+ * @port: ポートデバイス構造体
+ *
+ * AHCI仕様書 Section 10.3.2 に従ってポートを停止する
+ * 1. PxCMD.STをクリア
+ * 2. PxCMD.CRがクリアされるまで待機（最大500ms）
+ * 3. PxCMD.FREをクリア（オプション）
+ * 4. PxCMD.FRがクリアされるまで待機（オプション）
+ *
+ * Return: 成功時0、失敗時負のエラーコード
+ */
+int ahci_port_stop(struct ahci_port_device *port)
+{
+    void __iomem *port_mmio = port->port_mmio;
+    u32 cmd;
+    int ret;
+    
+    dev_info(port->device, "Stopping port %d\n", port->port_no);
+    
+    /* PxCMD.ST をクリア */
+    cmd = ioread32(port_mmio + AHCI_PORT_CMD);
+    if (!(cmd & AHCI_PORT_CMD_ST)) {
+        dev_info(port->device, "Port is already stopped\n");
+        return 0;
+    }
+    
+    cmd &= ~AHCI_PORT_CMD_ST;
+    iowrite32(cmd, port_mmio + AHCI_PORT_CMD);
+    
+    /* PxCMD.CR がクリアされるまで待機 */
+    ret = ahci_wait_bit_clear(port_mmio, AHCI_PORT_CMD,
+                               AHCI_PORT_CMD_CR, 500,
+                               port->device, "PxCMD.CR");
+    if (ret) {
+        dev_err(port->device, "Failed to stop port (CR did not clear)\n");
+        return ret;
+    }
+    
+    dev_info(port->device, "Port stopped (PxCMD=0x%08x)\n",
+             ioread32(port_mmio + AHCI_PORT_CMD));
+    
+    /* オプション: FIS受信も停止 */
+    cmd = ioread32(port_mmio + AHCI_PORT_CMD);
+    if (cmd & AHCI_PORT_CMD_FRE) {
+        cmd &= ~AHCI_PORT_CMD_FRE;
+        iowrite32(cmd, port_mmio + AHCI_PORT_CMD);
+        
+        /* PxCMD.FR がクリアされるまで待機 */
+        ret = ahci_wait_bit_clear(port_mmio, AHCI_PORT_CMD,
+                                   AHCI_PORT_CMD_FR, 500,
+                                   port->device, "PxCMD.FR");
+        if (ret) {
+            dev_warn(port->device, "FIS receive did not stop cleanly\n");
+        } else {
+            dev_info(port->device, "FIS receive stopped\n");
+        }
+    }
+    
+    return 0;
+}
+EXPORT_SYMBOL_GPL(ahci_port_stop);
+
+/**
+ * ahci_port_start - ポートを開始する
+ * @port: ポートデバイス構造体
+ *
+ * AHCI仕様書 Section 10.3.1 に従ってポートを開始する
+ * 前提条件: PxCLB/PxFBが設定済みであること
+ * 1. PxCMD.FREを有効化（FIS受信を開始）
+ * 2. PxCMD.FRが立つまで待機
+ * 3. PxCMD.STを有効化（コマンド処理を開始）
+ * 4. デバイス接続を確認
+ *
+ * Return: 成功時0、失敗時負のエラーコード
+ */
+int ahci_port_start(struct ahci_port_device *port)
+{
+    void __iomem *port_mmio = port->port_mmio;
+    u32 cmd, ssts;
+    int ret;
+    
+    dev_info(port->device, "Starting port %d\n", port->port_no);
+    
+    /* デバイス接続を確認 */
+    ssts = ioread32(port_mmio + AHCI_PORT_SSTS);
+    if ((ssts & AHCI_PORT_SSTS_DET) != AHCI_PORT_DET_ESTABLISHED) {
+        dev_warn(port->device, "No device detected (PxSSTS.DET=0x%x), starting anyway\n",
+                 ssts & AHCI_PORT_SSTS_DET);
+    } else {
+        dev_info(port->device, "Device detected (PxSSTS=0x%08x)\n", ssts);
+    }
+    
+    /* 既に起動している場合 */
+    cmd = ioread32(port_mmio + AHCI_PORT_CMD);
+    if (cmd & AHCI_PORT_CMD_ST) {
+        dev_info(port->device, "Port is already started\n");
+        return 0;
+    }
+    
+    /* Step 1: PxCMD.FRE を有効化（FIS受信を開始） */
+    if (!(cmd & AHCI_PORT_CMD_FRE)) {
+        dev_info(port->device, "Enabling FIS receive\n");
+        cmd |= AHCI_PORT_CMD_FRE;
+        iowrite32(cmd, port_mmio + AHCI_PORT_CMD);
+        
+        /* Step 2: PxCMD.FR が立つまで待機 */
+        ret = ahci_wait_bit_set(port_mmio, AHCI_PORT_CMD,
+                                AHCI_PORT_CMD_FR, 500,
+                                port->device, "PxCMD.FR");
+        if (ret) {
+            dev_err(port->device, "Failed to enable FIS receive\n");
+            return ret;
+        }
+        dev_info(port->device, "FIS receive enabled\n");
+    }
+    
+    /* PxIS をクリア */
+    iowrite32(0xFFFFFFFF, port_mmio + AHCI_PORT_IS);
+    
+    /* Step 3: PxCMD.ST を有効化（コマンド処理を開始） */
+    cmd = ioread32(port_mmio + AHCI_PORT_CMD);
+    cmd |= AHCI_PORT_CMD_ST;
+    iowrite32(cmd, port_mmio + AHCI_PORT_CMD);
+    
+    dev_info(port->device, "Port started (PxCMD=0x%08x)\n",
+             ioread32(port_mmio + AHCI_PORT_CMD));
+    
+    return 0;
+}
+EXPORT_SYMBOL_GPL(ahci_port_start);
