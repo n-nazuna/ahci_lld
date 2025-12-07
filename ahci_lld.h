@@ -13,6 +13,10 @@
 #define DRIVER_NAME "ahci_lld"
 #define AHCI_MAX_PORTS 32
 
+/* Scatter-Gather configuration */
+#define AHCI_SG_BUFFER_SIZE     (128 * 1024)    /* 128KB per buffer */
+#define AHCI_SG_BUFFER_COUNT    2048            /* Max 2048 buffers = 256MB (4K sector × 65536) */
+
 /* Forward declarations */
 struct ahci_hba;
 struct ahci_port_device;
@@ -53,8 +57,11 @@ struct ahci_port_device {
     void *cmd_table;            /* Command Table (4KB for simplicity) */
     dma_addr_t cmd_table_dma;
     
-    void *data_buf;             /* Data buffer (4KB) */
-    dma_addr_t data_buf_dma;
+    /* Scatter-Gather buffers (128KB each) */
+    void *sg_buffers[AHCI_SG_BUFFER_COUNT];
+    dma_addr_t sg_buffers_dma[AHCI_SG_BUFFER_COUNT];
+    int sg_buffer_count;        /* Number of allocated SG buffers */
+    struct mutex sg_lock;       /* Lock for SG buffer allocation */
 };
 
 /* GHC (Global HBA Control) デバイス構造体 */
@@ -92,6 +99,7 @@ int ahci_port_start(struct ahci_port_device *port);
 int ahci_port_alloc_dma_buffers(struct ahci_port_device *port);
 void ahci_port_free_dma_buffers(struct ahci_port_device *port);
 int ahci_port_setup_dma(struct ahci_port_device *port);
+int ahci_port_ensure_sg_buffers(struct ahci_port_device *port, int needed);
 
 /* ahci_lld_cmd.c からエクスポートされるコマンド実行関数 */
 int ahci_port_issue_cmd(struct ahci_port_device *port, 

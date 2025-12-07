@@ -40,18 +40,8 @@ int ahci_port_issue_cmd(struct ahci_port_device *port,
         return -EINVAL;
     }
     
-    // /* デバイスがBUSYでないことを確認 */
-    // {
-    //     u32 tfd = ioread32(port_mmio + AHCI_PORT_TFD);
-    //     if (tfd & (0x80 | 0x08)) {  /* BSY or DRQ */
-    //         dev_err(port->device, "Device busy (PxTFD=0x%08x)\n", tfd);
-    //         return -EBUSY;
-    //     }
-    //     dev_info(port->device, "Device ready (PxTFD=0x%08x)\n", tfd);
-    // }
-    
-    // /* Write direction check */
-    // is_write = (req->flags & AHCI_CMD_FLAG_WRITE) ? true : false;
+    /* Write direction check */
+    is_write = (req->flags & AHCI_CMD_FLAG_WRITE) ? true : false;
     
     /* Command Header (slot 0) の設定 */
     cmd_hdr = (struct ahci_cmd_header *)port->cmd_list;
@@ -60,7 +50,7 @@ int ahci_port_issue_cmd(struct ahci_port_device *port,
     /* flags: CFL=5 (20 bytes / 4), W=write direction */
     cmd_hdr->flags = ahci_calc_cfl(sizeof(struct fis_reg_h2d));
     if (is_write)
-        cmd_hdr->flags |= AHCI_CMD_FLAG_WRITE;
+        cmd_hdr->flags |= AHCI_CMD_WRITE;  /* AHCI Command Header Write bit (bit 6) */
     cmd_hdr->prdtl = (req->buffer_len > 0) ? 1 : 0;  /* 1 or 0 PRDT entry */
     cmd_hdr->ctba = port->cmd_table_dma;
     
@@ -104,21 +94,57 @@ int ahci_port_issue_cmd(struct ahci_port_device *port,
     
     /* PRDT Entry の設定 (buffer_len > 0 の場合のみ) */
     if (req->buffer_len > 0) {
-        /* Write時はuser bufferからdata_bufへコピー */
-        if (is_write) {
-            if (req->buffer_len > 4096) {
-                dev_err(port->device, "Buffer too large: %u > 4096\n", req->buffer_len);
-                return -EINVAL;
-            }
-            memcpy(port->data_buf, buf, req->buffer_len);
+        u32 remaining = req->buffer_len;
+        u32 offset = 0;
+        int prdt_count = 0;
+        int sg_needed;
+        int ret;
+        
+        /* 必要なSGバッファ数を計算 */
+        sg_needed = (req->buffer_len + AHCI_SG_BUFFER_SIZE - 1) / AHCI_SG_BUFFER_SIZE;
+        if (sg_needed > AHCI_SG_BUFFER_COUNT) {
+            dev_err(port->device, "Transfer size %u exceeds max (%u)\n",
+                    req->buffer_len, AHCI_SG_BUFFER_COUNT * AHCI_SG_BUFFER_SIZE);
+            return -EINVAL;
         }
         
-        prdt = &cmd_tbl->prdt[0];
-        prdt->dba = port->data_buf_dma;
-        prdt->dbc = req->buffer_len - 1;  /* 0-based */
+        /* SGバッファを確保 */
+        ret = ahci_port_ensure_sg_buffers(port, sg_needed);
+        if (ret) {
+            dev_err(port->device, "Failed to ensure %d SG buffers\n", sg_needed);
+            return ret;
+        }
         
-        dev_info(port->device, "PRDT[0]: dba=0x%llx dbc=%u\n",
-                 prdt->dba, prdt->dbc + 1);
+        /* Write時: user buffer → SG buffers */
+        if (is_write) {
+            int i;
+            for (i = 0; i < sg_needed && remaining > 0; i++) {
+                u32 chunk = remaining > AHCI_SG_BUFFER_SIZE ? AHCI_SG_BUFFER_SIZE : remaining;
+                memcpy(port->sg_buffers[i], (u8 *)buf + offset, chunk);
+                offset += chunk;
+                remaining -= chunk;
+            }
+            remaining = req->buffer_len;
+            offset = 0;
+        }
+        
+        /* PRDT entries構築 */
+        {
+            int i;
+            prdt = cmd_tbl->prdt;
+            for (i = 0; i < sg_needed && remaining > 0; i++) {
+                u32 chunk = remaining > AHCI_SG_BUFFER_SIZE ? AHCI_SG_BUFFER_SIZE : remaining;
+                prdt[i].dba = port->sg_buffers_dma[i];
+                prdt[i].dbc = chunk - 1;  /* 0-based */
+                remaining -= chunk;
+                prdt_count++;
+            }
+        }
+        
+        cmd_hdr->prdtl = prdt_count;
+        
+        dev_info(port->device, "PRDT: %d entries for %u bytes\n",
+                 prdt_count, req->buffer_len);
     }
     
     /* PxIS をクリア */
@@ -183,9 +209,19 @@ int ahci_port_issue_cmd(struct ahci_port_device *port,
                 return -EIO;
             }
             
-            /* 正常完了: Read時はdata_bufからuser bufferへコピー */
+            /* 正常完了: Read時はSG buffers → user buffer */
             if (!is_write && req->buffer_len > 0) {
-                memcpy(buf, port->data_buf, req->buffer_len);
+                u32 remaining = req->buffer_len;
+                u32 offset = 0;
+                int sg_needed = (req->buffer_len + AHCI_SG_BUFFER_SIZE - 1) / AHCI_SG_BUFFER_SIZE;
+                int i;
+                
+                for (i = 0; i < sg_needed && remaining > 0; i++) {
+                    u32 chunk = remaining > AHCI_SG_BUFFER_SIZE ? AHCI_SG_BUFFER_SIZE : remaining;
+                    memcpy((u8 *)buf + offset, port->sg_buffers[i], chunk);
+                    offset += chunk;
+                    remaining -= chunk;
+                }
             }
             
             /* PxIS をクリア */
@@ -226,3 +262,4 @@ int ahci_port_issue_identify(struct ahci_port_device *port, void *buf)
     return ahci_port_issue_cmd(port, &req, buf);
 }
 EXPORT_SYMBOL_GPL(ahci_port_issue_identify);
+

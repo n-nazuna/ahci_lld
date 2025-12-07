@@ -105,8 +105,10 @@ static long ahci_lld_ioctl(struct file *file, unsigned int cmd,
         
         /* データバッファが必要な場合は確保 */
         if (req.buffer_len > 0) {
-            if (req.buffer_len > 4096) {
-                dev_err(port_dev->device, "Buffer too large: %u > 4096\n", req.buffer_len);
+            /* Scatter-Gather対応により最大256MBまで可能 */
+            if (req.buffer_len > AHCI_SG_BUFFER_SIZE * AHCI_SG_BUFFER_COUNT) {
+                dev_err(port_dev->device, "Buffer too large: %u > %u\n",
+                        req.buffer_len, AHCI_SG_BUFFER_SIZE * AHCI_SG_BUFFER_COUNT);
                 ret = -EINVAL;
                 break;
             }
