@@ -376,6 +376,24 @@ int ahci_port_start(struct ahci_port_device *port)
     dev_info(port->device, "Port started (PxCMD=0x%08x)\n",
              ioread32(port_mmio + AHCI_PORT_CMD));
     
+    /* デバイスがBUSY状態から抜けるまで待機 (最大1秒) */
+    {
+        int timeout = 1000;
+        while (timeout > 0) {
+            u32 tfd = ioread32(port_mmio + AHCI_PORT_TFD);
+            if (!(tfd & (0x80 | 0x08))) {  /* BSY and DRQ cleared */
+                dev_info(port->device, "Device ready (PxTFD=0x%08x)\n", tfd);
+                break;
+            }
+            msleep(1);
+            timeout--;
+        }
+        if (timeout == 0) {
+            u32 tfd = ioread32(port_mmio + AHCI_PORT_TFD);
+            dev_warn(port->device, "Device still busy after port start (PxTFD=0x%08x)\n", tfd);
+        }
+    }
+    
     return 0;
 }
 EXPORT_SYMBOL_GPL(ahci_port_start);

@@ -15,6 +15,7 @@
 #include <linux/uaccess.h>
 #include "ahci_lld.h"
 #include "ahci_lld_ioctl.h"
+#include "ahci_lld_fis.h"
 
 static int ahci_lld_major = 0;
 static struct class *ahci_lld_class = NULL;
@@ -86,9 +87,71 @@ static long ahci_lld_ioctl(struct file *file, unsigned int cmd,
     
     /* Command Issue */
     case AHCI_IOC_ISSUE_CMD:
-        dev_info(port_dev->device, "IOCTL: Issue Command (not implemented)\n");
-        ret = -ENOSYS;
+    {
+        struct ahci_cmd_request req;
+        u8 *data_buf = NULL;
+        
+        dev_info(port_dev->device, "IOCTL: Issue Command\n");
+        
+        /* ユーザー空間から引数をコピー */
+        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
+            dev_err(port_dev->device, "Failed to copy command request from user\n");
+            ret = -EFAULT;
+            break;
+        }
+        
+        dev_info(port_dev->device, "Command: 0x%02x, LBA=0x%llx, Count=%u, buffer size: %u\n",
+                 req.command, req.lba, req.count, req.buffer_len);
+        
+        /* データバッファが必要な場合は確保 */
+        if (req.buffer_len > 0) {
+            /* Scatter-Gather対応により最大256MBまで可能 */
+            if (req.buffer_len > AHCI_SG_BUFFER_SIZE * AHCI_SG_BUFFER_COUNT) {
+                dev_err(port_dev->device, "Buffer too large: %u > %u\n",
+                        req.buffer_len, AHCI_SG_BUFFER_SIZE * AHCI_SG_BUFFER_COUNT);
+                ret = -EINVAL;
+                break;
+            }
+            
+            data_buf = kmalloc(req.buffer_len, GFP_KERNEL);
+            if (!data_buf) {
+                ret = -ENOMEM;
+                break;
+            }
+            
+            /* Write direction の場合はユーザーバッファからコピー */
+            if (req.flags & AHCI_CMD_FLAG_WRITE) {
+                if (copy_from_user(data_buf, (void __user *)req.buffer, req.buffer_len)) {
+                    dev_err(port_dev->device, "Failed to copy write buffer from user\n");
+                    kfree(data_buf);
+                    ret = -EFAULT;
+                    break;
+                }
+            }
+        }
+        
+        /* コマンド発行 */
+        ret = ahci_port_issue_cmd(port_dev, &req, data_buf);
+        if (ret == 0) {
+            /* Read direction の場合はユーザーバッファへコピー */
+            if (!(req.flags & AHCI_CMD_FLAG_WRITE) && req.buffer_len > 0) {
+                if (copy_to_user((void __user *)req.buffer, data_buf, req.buffer_len)) {
+                    dev_err(port_dev->device, "Failed to copy result to user\n");
+                    ret = -EFAULT;
+                }
+            }
+            
+            /* 結果フィールド (status, error, etc) をユーザー空間へコピー */
+            if (copy_to_user((void __user *)arg, &req, sizeof(req))) {
+                dev_err(port_dev->device, "Failed to copy result fields to user\n");
+                ret = -EFAULT;
+            }
+        }
+        
+        if (data_buf)
+            kfree(data_buf);
         break;
+    }
     
     /* Read Dump */
     case AHCI_IOC_READ_REGS:
@@ -241,6 +304,29 @@ static int ahci_create_port_device(struct ahci_hba *hba, int port_no)
     
     hba->ports[port_no] = port_dev;
     
+    /* DMAバッファの割り当て */
+    ret = ahci_port_alloc_dma_buffers(port_dev);
+    if (ret) {
+        dev_err(&hba->pdev->dev, "Failed to allocate DMA buffers for port %d\n", port_no);
+        device_destroy(ahci_lld_class, port_dev->devno);
+        cdev_del(&port_dev->cdev);
+        kfree(port_dev);
+        hba->ports[port_no] = NULL;
+        return ret;
+    }
+    
+    /* DMAアドレスをポートレジスタに設定 */
+    ret = ahci_port_setup_dma(port_dev);
+    if (ret) {
+        dev_err(&hba->pdev->dev, "Failed to setup DMA for port %d\n", port_no);
+        ahci_port_free_dma_buffers(port_dev);
+        device_destroy(ahci_lld_class, port_dev->devno);
+        cdev_del(&port_dev->cdev);
+        kfree(port_dev);
+        hba->ports[port_no] = NULL;
+        return ret;
+    }
+    
     pr_info("ahci_lld: Created device for port %d\n", port_no);
     return 0;
 }
@@ -252,6 +338,9 @@ static void ahci_destroy_port_device(struct ahci_hba *hba, int port_no)
     
     if (!port_dev)
         return;
+    
+    /* DMAバッファの解放 */
+    ahci_port_free_dma_buffers(port_dev);
     
     device_destroy(ahci_lld_class, port_dev->devno);
     cdev_del(&port_dev->cdev);
