@@ -8,6 +8,7 @@
 #include <linux/pci.h>
 #include <linux/cdev.h>
 #include "ahci_lld_reg.h"
+#include "ahci_lld_ioctl.h"
 
 #define DRIVER_NAME "ahci_lld"
 #define AHCI_MAX_PORTS 32
@@ -93,6 +94,8 @@ void ahci_port_free_dma_buffers(struct ahci_port_device *port);
 int ahci_port_setup_dma(struct ahci_port_device *port);
 
 /* ahci_lld_cmd.c からエクスポートされるコマンド実行関数 */
+int ahci_port_issue_cmd(struct ahci_port_device *port, 
+                        struct ahci_cmd_request *req, void *buf);
 int ahci_port_issue_identify(struct ahci_port_device *port, void *buf);
 
 #endif /* AHCI_LLD_H */

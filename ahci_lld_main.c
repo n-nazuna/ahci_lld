@@ -89,6 +89,7 @@ static long ahci_lld_ioctl(struct file *file, unsigned int cmd,
     case AHCI_IOC_ISSUE_CMD:
     {
         struct ahci_cmd_request req;
+        u8 *data_buf = NULL;
         
         dev_info(port_dev->device, "IOCTL: Issue Command\n");
         
@@ -99,40 +100,54 @@ static long ahci_lld_ioctl(struct file *file, unsigned int cmd,
             break;
         }
         
-        dev_info(port_dev->device, "Command: 0x%02x, buffer size: %u\n",
-                 req.command, req.buffer_len);
+        dev_info(port_dev->device, "Command: 0x%02x, LBA=0x%llx, Count=%u, buffer size: %u\n",
+                 req.command, req.lba, req.count, req.buffer_len);
         
-        /* IDENTIFY DEVICEのみサポート */
-        if (req.command == ATA_CMD_IDENTIFY_DEVICE) {
-            u8 *identify_buf;
-            
-            if (req.buffer_len < 512) {
-                dev_err(port_dev->device, "Buffer too small for IDENTIFY (need 512 bytes)\n");
+        /* データバッファが必要な場合は確保 */
+        if (req.buffer_len > 0) {
+            if (req.buffer_len > 4096) {
+                dev_err(port_dev->device, "Buffer too large: %u > 4096\n", req.buffer_len);
                 ret = -EINVAL;
                 break;
             }
             
-            identify_buf = kmalloc(512, GFP_KERNEL);
-            if (!identify_buf) {
+            data_buf = kmalloc(req.buffer_len, GFP_KERNEL);
+            if (!data_buf) {
                 ret = -ENOMEM;
                 break;
             }
             
-            /* IDENTIFY DEVICE コマンド発行 */
-            ret = ahci_port_issue_identify(port_dev, identify_buf);
-            if (ret == 0) {
-                /* 結果をユーザー空間にコピー */
-                if (copy_to_user((void __user *)req.buffer, identify_buf, 512)) {
+            /* Write direction の場合はユーザーバッファからコピー */
+            if (req.flags & AHCI_CMD_FLAG_WRITE) {
+                if (copy_from_user(data_buf, (void __user *)req.buffer, req.buffer_len)) {
+                    dev_err(port_dev->device, "Failed to copy write buffer from user\n");
+                    kfree(data_buf);
+                    ret = -EFAULT;
+                    break;
+                }
+            }
+        }
+        
+        /* コマンド発行 */
+        ret = ahci_port_issue_cmd(port_dev, &req, data_buf);
+        if (ret == 0) {
+            /* Read direction の場合はユーザーバッファへコピー */
+            if (!(req.flags & AHCI_CMD_FLAG_WRITE) && req.buffer_len > 0) {
+                if (copy_to_user((void __user *)req.buffer, data_buf, req.buffer_len)) {
                     dev_err(port_dev->device, "Failed to copy result to user\n");
                     ret = -EFAULT;
                 }
             }
             
-            kfree(identify_buf);
-        } else {
-            dev_err(port_dev->device, "Unsupported command: 0x%02x\n", req.command);
-            ret = -EINVAL;
+            /* 結果フィールド (status, error, etc) をユーザー空間へコピー */
+            if (copy_to_user((void __user *)arg, &req, sizeof(req))) {
+                dev_err(port_dev->device, "Failed to copy result fields to user\n");
+                ret = -EFAULT;
+            }
         }
+        
+        if (data_buf)
+            kfree(data_buf);
         break;
     }
     

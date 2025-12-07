@@ -141,6 +141,26 @@ int main(int argc, char *argv[])
     
     printf("Opened %s (fd=%d)\n\n", dev_path, fd);
     
+    /* COMRESETを実行 */
+    printf("Performing COMRESET...\n");
+    ret = ioctl(fd, AHCI_IOC_PORT_RESET);
+    if (ret < 0) {
+        perror("Failed to perform COMRESET");
+        close(fd);
+        return 1;
+    }
+    printf("COMRESET completed\n\n");
+    
+    /* ポートを起動 */
+    printf("Starting port...\n");
+    ret = ioctl(fd, AHCI_IOC_PORT_START);
+    if (ret < 0) {
+        perror("Failed to start port");
+        close(fd);
+        return 1;
+    }
+    printf("Port started\n\n");
+    
     /* IDENTIFY DEVICE コマンドを準備 */
     memset(&req, 0, sizeof(req));
     req.command = 0xEC;  /* ATA_CMD_IDENTIFY_DEVICE */
@@ -155,7 +175,11 @@ int main(int argc, char *argv[])
         return 1;
     }
     
-    printf("IDENTIFY DEVICE succeeded!\n\n");
+    printf("IDENTIFY DEVICE succeeded!\n");
+    printf("  Status: 0x%02x, Error: 0x%02x, Device: 0x%02x\n",
+           req.status, req.error, req.device_out);
+    printf("  LBA out: 0x%llx, Count out: %u\n\n",
+           (unsigned long long)req.lba_out, req.count_out);
     
     /* IDENTIFY データを解析 */
     id = (struct ata_identify *)identify_buf;

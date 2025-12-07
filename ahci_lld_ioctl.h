@@ -40,6 +40,16 @@ struct ahci_cmd_request {
     __u64 buffer;           /* User buffer address */
     __u32 buffer_len;       /* Buffer length in bytes */
     __u32 timeout_ms;       /* Timeout in milliseconds */
+    
+    /* 結果 (out) */
+    __u8 status;            /* Status register (from D2H FIS) */
+    __u8 error;             /* Error register (from D2H FIS) */
+    __u8 device_out;        /* Device register (from D2H FIS) */
+    __u8 reserved3;
+    
+    __u64 lba_out;          /* LBA result (from D2H FIS) */
+    __u16 count_out;        /* Count result (from D2H FIS) */
+    __u16 reserved4;
 };
 
 /* コマンドフラグ */
