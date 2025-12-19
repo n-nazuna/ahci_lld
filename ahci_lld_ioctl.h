@@ -21,6 +21,9 @@
 /* Command Issue */
 #define AHCI_IOC_ISSUE_CMD      _IOWR(AHCI_LLD_IOC_MAGIC, 10, struct ahci_cmd_request)
 
+/* NCQ Command Completion Probe */
+#define AHCI_IOC_PROBE_CMD      _IOR(AHCI_LLD_IOC_MAGIC, 11, struct ahci_sdb)
+
 /* Read Dump */
 #define AHCI_IOC_READ_REGS      _IOR(AHCI_LLD_IOC_MAGIC, 20, struct ahci_port_regs)
 
@@ -45,17 +48,30 @@ struct ahci_cmd_request {
     __u8 status;            /* Status register (from D2H FIS) */
     __u8 error;             /* Error register (from D2H FIS) */
     __u8 device_out;        /* Device register (from D2H FIS) */
-    __u8 reserved3;
+    __u8 tag;               /* Assigned tag (NCQ only, out) */
     
     __u64 lba_out;          /* LBA result (from D2H FIS) */
     __u16 count_out;        /* Count result (from D2H FIS) */
-    __u16 reserved4;
+    __u16 reserved4[3];
 };
 
 /* コマンドフラグ */
 #define AHCI_CMD_FLAG_WRITE     (1 << 0)  /* Write direction */
 #define AHCI_CMD_FLAG_ATAPI     (1 << 1)  /* ATAPI command */
-#define AHCI_CMD_FLAG_PREFETCH  (1 << 2)  /* Prefetchable */
+#define AHCI_CMD_FLAG_ASYNC     (1 << 2)  /* Async execution (NCQ) */
+#define AHCI_CMD_FLAG_PREFETCH  (1 << 3)  /* Prefetchable */
+
+/* Set Device Bits 構造体 - NCQ完了情報 */
+struct ahci_sdb {
+    /* === Output === */
+    __u32 sactive;          /* PxSACT - Currently active slots */
+    __u32 completed;        /* Completed slots bitmap (returned in this call) */
+    
+    /* 32 slot information arrays (index = tag number) */
+    __u8 status[32];        /* ATA Status (valid for completed slots only) */
+    __u8 error[32];         /* ATA Error (valid for completed slots only) */
+    __u64 buffer[32];       /* Buffer pointer (valid for completed slots only) */
+};
 
 /* ポートレジスタダンプ構造体 */
 struct ahci_port_regs {

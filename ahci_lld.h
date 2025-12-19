@@ -63,6 +63,20 @@ struct ahci_hba {
     struct class *class;
 };
 
+/* NCQ Slot Information */
+struct ahci_cmd_slot {
+    struct ahci_cmd_request *req;   /* Command request */
+    void *buffer;                   /* Kernel buffer */
+    u32 buffer_len;                 /* Buffer length */
+    bool is_write;                  /* Write direction flag */
+    bool completed;                 /* Completion flag */
+    int result;                     /* Result code */
+    
+    /* SG buffer allocation */
+    int sg_start_idx;               /* Starting SG buffer index */
+    int sg_count;                   /* Number of SG buffers used */
+};
+
 /* Port構造体 */
 struct ahci_port_device {
     struct cdev cdev;
@@ -79,14 +93,31 @@ struct ahci_port_device {
     void *fis_area;             /* Received FIS (256 bytes, 256-byte-aligned) */
     dma_addr_t fis_area_dma;
     
-    void *cmd_table;            /* Command Table (4KB for simplicity) */
+    void *cmd_table;            /* Command Table (4KB for simplicity) - slot 0 only */
     dma_addr_t cmd_table_dma;
+    
+    /* NCQ: Command Tables for 32 slots */
+    void *cmd_tables[32];
+    dma_addr_t cmd_tables_dma[32];
     
     /* Scatter-Gather buffers (128KB each) */
     void *sg_buffers[AHCI_SG_BUFFER_COUNT];
     dma_addr_t sg_buffers_dma[AHCI_SG_BUFFER_COUNT];
     int sg_buffer_count;        /* Number of allocated SG buffers */
     struct mutex sg_lock;       /* Lock for SG buffer allocation */
+    
+    /* NCQ: Slot management */
+    unsigned long slots_in_use;     /* Bitmap of used slots (32 bits) */
+    unsigned long slots_completed;  /* Bitmap of completed slots */
+    spinlock_t slot_lock;           /* Slot allocation lock */
+    struct ahci_cmd_slot slots[32]; /* Per-slot information */
+    
+    /* NCQ: Statistics */
+    bool ncq_enabled;               /* NCQ enabled flag */
+    int ncq_depth;                  /* NCQ queue depth (1-32) */
+    atomic_t active_slots;          /* Number of active slots */
+    u64 ncq_issued;                 /* Number of NCQ commands issued */
+    u64 ncq_completed;              /* Number of NCQ commands completed */
 };
 
 /* GHC (Global HBA Control) デバイス構造体 */

@@ -116,6 +116,17 @@ int ahci_port_init(struct ahci_port_device *port)
     /* PxIS をクリア */
     iowrite32(0xFFFFFFFF, port_mmio + AHCI_PORT_IS);
     
+    /* Step 6: NCQ関連の初期化 */
+    spin_lock_init(&port->slot_lock);
+    port->slots_in_use = 0;
+    port->slots_completed = 0;
+    memset(port->slots, 0, sizeof(port->slots));
+    port->ncq_enabled = false;  /* Initially disabled, enable with first async command */
+    port->ncq_depth = 32;       /* Default max depth */
+    atomic_set(&port->active_slots, 0);
+    port->ncq_issued = 0;
+    port->ncq_completed = 0;
+    
     dev_info(port->device, "Port initialization complete (PxCMD=0x%08x)\n",
              ioread32(port_mmio + AHCI_PORT_CMD));
     

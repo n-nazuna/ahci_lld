@@ -153,6 +153,56 @@ static long ahci_lld_ioctl(struct file *file, unsigned int cmd,
         break;
     }
     
+    /* Probe Completed Commands (NCQ) */
+    case AHCI_IOC_PROBE_CMD:
+    {
+        struct ahci_sdb sdb;
+        unsigned long flags;
+        int tag;
+        
+        dev_dbg(port_dev->device, "IOCTL: Probe Commands\n");
+        
+        memset(&sdb, 0, sizeof(sdb));
+        
+        spin_lock_irqsave(&port_dev->slot_lock, flags);
+        
+        /* Read PxSACT (currently active slots) */
+        sdb.sactive = ioread32(port_dev->port_mmio + AHCI_PORT_SACT);
+        
+        /* Check completed slots */
+        for (tag = 0; tag < 32; tag++) {
+            if (port_dev->slots[tag].completed) {
+                /* Mark as completed */
+                sdb.completed |= (1 << tag);
+                
+                /* Copy status/error */
+                if (port_dev->slots[tag].req) {
+                    sdb.status[tag] = port_dev->slots[tag].req->status;
+                    sdb.error[tag] = port_dev->slots[tag].req->error;
+                }
+                
+                /* Buffer pointer (user space address) */
+                if (port_dev->slots[tag].req) {
+                    sdb.buffer[tag] = port_dev->slots[tag].req->buffer;
+                }
+                
+                /* Clear completed flag (so it won't be returned again) */
+                port_dev->slots[tag].completed = false;
+            }
+        }
+        
+        spin_unlock_irqrestore(&port_dev->slot_lock, flags);
+        
+        /* Copy result to user space */
+        if (copy_to_user((void __user *)arg, &sdb, sizeof(sdb))) {
+            dev_err(port_dev->device, "Failed to copy SDB to user\n");
+            ret = -EFAULT;
+        } else {
+            ret = 0;
+        }
+        break;
+    }
+    
     /* Read Dump */
     case AHCI_IOC_READ_REGS:
         dev_info(port_dev->device, "IOCTL: Read Port Registers (not implemented)\n");
