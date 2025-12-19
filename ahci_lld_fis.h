@@ -22,6 +22,16 @@
 #define FIS_TYPE_DEV_BITS   0xA1    /* Set Device Bits FIS - Device to Host */
 
 /* ========================================================================
+ * ATA Command Codes
+ * ======================================================================== */
+
+#define ATA_CMD_READ_DMA           0x25  /* READ DMA (Non-NCQ) */
+#define ATA_CMD_WRITE_DMA          0x35  /* WRITE DMA (Non-NCQ) */
+#define ATA_CMD_READ_FPDMA_QUEUED  0x60  /* READ FPDMA QUEUED (NCQ) */
+#define ATA_CMD_WRITE_FPDMA_QUEUED 0x61  /* WRITE FPDMA QUEUED (NCQ) */
+#define ATA_CMD_IDENTIFY           0xEC  /* IDENTIFY DEVICE */
+
+/* ========================================================================
  * Command FIS - Register Host to Device (Section 10.5.5)
  * ======================================================================== */
 
@@ -149,6 +159,17 @@ struct fis_set_dev_bits {
 
 #define FIS_SDB_INTERRUPT      (1 << 6)  /* Interrupt bit */
 #define FIS_SDB_NOTIFICATION   (1 << 5)  /* Notification bit */
+
+/* ========================================================================
+ * Received FIS Structure Offsets (Section 4.2.1)
+ * ======================================================================== */
+
+#define AHCI_RX_FIS_DMA     0x00  /* DMA Setup FIS offset */
+#define AHCI_RX_FIS_PIO     0x20  /* PIO Setup FIS offset */
+#define AHCI_RX_FIS_D2H     0x40  /* D2H Register FIS offset */
+#define AHCI_RX_FIS_SDB     0x58  /* Set Device Bits FIS offset */
+#define AHCI_RX_FIS_UNK     0x60  /* Unknown FIS offset */
+#define AHCI_RX_FIS_SIZE    256   /* Total size of RX FIS area */
 
 /* ========================================================================
  * DMA Activate FIS (Section 10.5.8)

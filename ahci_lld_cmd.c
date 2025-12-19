@@ -263,3 +263,186 @@ int ahci_port_issue_identify(struct ahci_port_device *port, void *buf)
 }
 EXPORT_SYMBOL_GPL(ahci_port_issue_identify);
 
+/**
+ * ahci_port_issue_cmd_async - Issue ATA command asynchronously (NCQ)
+ * @port: Port device structure
+ * @req: Command request structure (input/output)
+ * @buf: Data buffer (kernel space)
+ *
+ * Issues a command asynchronously and returns immediately.
+ * Command completion must be checked via ahci_check_slot_completion().
+ *
+ * Return: 0 on success (req->tag contains assigned slot), negative error code on failure
+ */
+int ahci_port_issue_cmd_async(struct ahci_port_device *port,
+                               struct ahci_cmd_request *req, void *buf)
+{
+    void __iomem *port_mmio = port->port_mmio;
+    struct ahci_cmd_header *cmd_hdr;
+    struct ahci_cmd_table *cmd_tbl;
+    struct fis_reg_h2d *fis;
+    struct ahci_prdt_entry *prdt;
+    u32 cmd_stat;
+    int slot;
+    int ret;
+    bool is_write;
+    unsigned long flags;
+    
+    /* Enable NCQ mode if not already enabled */
+    if (!port->ncq_enabled) {
+        dev_info(port->device, "Enabling NCQ mode\n");
+        port->ncq_enabled = true;
+    }
+    
+    /* Use user-specified tag as slot number */
+    slot = req->tag;
+    if (slot < 0 || slot >= 32) {
+        dev_err(port->device, "Invalid tag/slot number: %d\n", slot);
+        return -EINVAL;
+    }
+    
+    /* Check if slot is already in use */
+    spin_lock_irqsave(&port->slot_lock, flags);
+    if (test_bit(slot, &port->slots_in_use)) {
+        spin_unlock_irqrestore(&port->slot_lock, flags);
+        dev_err(port->device, "Slot %d already in use\n", slot);
+        return -EBUSY;
+    }
+    set_bit(slot, &port->slots_in_use);
+    atomic_inc(&port->active_slots);
+    spin_unlock_irqrestore(&port->slot_lock, flags);
+    
+    /* Check if port is started */
+    cmd_stat = ioread32(port_mmio + AHCI_PORT_CMD);
+    if (!(cmd_stat & AHCI_PORT_CMD_ST)) {
+        dev_err(port->device, "Port not started (PxCMD=0x%08x)\n", cmd_stat);
+        ahci_free_slot(port, slot);
+        return -EINVAL;
+    }
+    
+    is_write = (req->flags & AHCI_CMD_FLAG_WRITE) ? true : false;
+    
+    /* Store slot information - copy the request structure */
+    spin_lock_irqsave(&port->slot_lock, flags);
+    port->slots[slot].req = *req;  /* Copy the entire structure */
+    port->slots[slot].buffer = buf;
+    port->slots[slot].buffer_len = req->buffer_len;
+    port->slots[slot].is_write = is_write;
+    port->slots[slot].completed = false;
+    port->slots[slot].result = 0;
+    spin_unlock_irqrestore(&port->slot_lock, flags);
+    
+    /* Allocate command table for this slot if not already allocated */
+    if (!port->cmd_tables[slot]) {
+        port->cmd_tables[slot] = dma_alloc_coherent(&port->hba->pdev->dev,
+                                                     AHCI_CMD_TABLE_SIZE,
+                                                     &port->cmd_tables_dma[slot],
+                                                     GFP_KERNEL);
+        if (!port->cmd_tables[slot]) {
+            dev_err(port->device, "Failed to allocate command table for slot %d\n", slot);
+            ahci_free_slot(port, slot);
+            return -ENOMEM;
+        }
+    }
+    
+    /* Setup Command Header */
+    cmd_hdr = &((struct ahci_cmd_header *)port->cmd_list)[slot];
+    memset(cmd_hdr, 0, sizeof(*cmd_hdr));
+    
+    cmd_hdr->flags = ahci_calc_cfl(sizeof(struct fis_reg_h2d));
+    if (is_write)
+        cmd_hdr->flags |= AHCI_CMD_WRITE;
+    
+    cmd_hdr->ctba = port->cmd_tables_dma[slot];
+    
+    /* Setup Command Table */
+    cmd_tbl = port->cmd_tables[slot];
+    memset(cmd_tbl, 0, AHCI_CMD_TABLE_SIZE);
+    
+    /* Build FIS */
+    fis = (struct fis_reg_h2d *)cmd_tbl->cfis;
+    fis->fis_type = FIS_TYPE_REG_H2D;
+    fis->flags = FIS_H2D_FLAG_CMD;
+    fis->command = req->command;
+    fis->features = req->features;
+    fis->device = req->device;
+    
+    fis->lba_low = req->lba & 0xFF;
+    fis->lba_mid = (req->lba >> 8) & 0xFF;
+    fis->lba_high = (req->lba >> 16) & 0xFF;
+    fis->lba_low_exp = (req->lba >> 24) & 0xFF;
+    fis->lba_mid_exp = (req->lba >> 32) & 0xFF;
+    fis->lba_high_exp = (req->lba >> 40) & 0xFF;
+    
+    fis->count = req->count & 0xFF;
+    fis->count_exp = (req->count >> 8) & 0xFF;
+    
+    /* Setup PRDT (Scatter-Gather) if buffer exists */
+    if (req->buffer_len > 0 && buf) {
+        u32 remaining;
+        u32 offset;
+        int sg_idx;
+        int prdt_idx;
+        
+        ret = ahci_port_ensure_sg_buffers(port, 
+                                          (req->buffer_len + AHCI_SG_BUFFER_SIZE - 1) / AHCI_SG_BUFFER_SIZE);
+        if (ret < 0) {
+            dev_err(port->device, "Failed to ensure SG buffers\n");
+            ahci_free_slot(port, slot);
+            return ret;
+        }
+        
+        /* Copy data to SG buffers for WRITE */
+        if (is_write) {
+            remaining = req->buffer_len;
+            offset = 0;
+            sg_idx = 0;
+            
+            while (remaining > 0 && sg_idx < port->sg_buffer_count) {
+                u32 chunk = (remaining > AHCI_SG_BUFFER_SIZE) ? AHCI_SG_BUFFER_SIZE : remaining;
+                memcpy(port->sg_buffers[sg_idx], buf + offset, chunk);
+                remaining -= chunk;
+                offset += chunk;
+                sg_idx++;
+            }
+        }
+        
+        /* Build PRDT */
+        prdt = cmd_tbl->prdt;
+        remaining = req->buffer_len;
+        prdt_idx = 0;
+        sg_idx = 0;
+        
+        while (remaining > 0 && sg_idx < port->sg_buffer_count) {
+            u32 chunk = (remaining > AHCI_SG_BUFFER_SIZE) ? AHCI_SG_BUFFER_SIZE : remaining;
+            
+            prdt[prdt_idx].dba = port->sg_buffers_dma[sg_idx];
+            prdt[prdt_idx].reserved = 0;
+            prdt[prdt_idx].dbc = chunk - 1;
+            
+            remaining -= chunk;
+            sg_idx++;
+            prdt_idx++;
+        }
+        
+        cmd_hdr->prdtl = prdt_idx;
+    } else {
+        cmd_hdr->prdtl = 0;
+    }
+    
+    /* Issue command (NCQ uses both PxSACT and PxCI) */
+    wmb();  /* Ensure all writes are visible */
+    iowrite32(1 << slot, port_mmio + AHCI_PORT_SACT);  /* Set PxSACT for NCQ */
+    iowrite32(1 << slot, port_mmio + AHCI_PORT_CI);    /* Set PxCI to issue command */
+    
+    /* Update statistics */
+    port->ncq_issued++;
+    
+    /* Return assigned tag */
+    req->tag = slot;
+    
+    dev_info(port->device, "NCQ command 0x%02x issued on slot %d\n", req->command, slot);
+    
+    return 0;
+}
+EXPORT_SYMBOL_GPL(ahci_port_issue_cmd_async);
