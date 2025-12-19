@@ -1,12 +1,20 @@
 /*
  * AHCI Low Level Driver - Register Definitions
+ * 
+ * Based on:
+ * - AHCI Specification Rev 1.3.1 (Serial ATA Advanced Host Controller Interface)
+ * - SATA Specification Rev 3.x
+ * 
+ * This header defines all HBA registers, port registers, and bit masks
+ * according to AHCI specification.
  */
 
 #ifndef AHCI_LLD_REG_H
 #define AHCI_LLD_REG_H
 
 /* ========================================================================
- * Generic Host Control Registers (Section 3.1)
+ * Generic Host Control Registers (AHCI 1.3.1 Section 3.1)
+ * Base offset: 0x00
  * ======================================================================== */
 
 /* AHCI Generic Host Control レジスタオフセット */
@@ -86,6 +94,31 @@
 #define AHCI_PORT_FBS   0x40    /* FIS-based Switching Control */
 #define AHCI_PORT_DEVSLP 0x44   /* Device Sleep */
 
+/* ========================================================================
+ * ATA Command Codes (ATA8-ACS)
+ * These are standard ATA command codes sent in the Command field of H2D FIS
+ * ======================================================================== */
+#define ATA_CMD_IDENTIFY_DEVICE     0xEC    /* IDENTIFY DEVICE */
+#define ATA_CMD_READ_DMA_EXT        0x25    /* READ DMA EXT (48-bit LBA) */
+#define ATA_CMD_WRITE_DMA_EXT       0x35    /* WRITE DMA EXT (48-bit LBA) */
+#define ATA_CMD_READ_FPDMA_QUEUED   0x60    /* READ FPDMA QUEUED (NCQ) */
+#define ATA_CMD_WRITE_FPDMA_QUEUED  0x61    /* WRITE FPDMA QUEUED (NCQ) */
+#define ATA_CMD_READ_SECTORS_EXT    0x24    /* READ SECTORS EXT (PIO) */
+#define ATA_CMD_WRITE_SECTORS_EXT   0x34    /* WRITE SECTORS EXT (PIO) */
+
+/* ATA Status Register bits (returned in D2H FIS) */
+#define ATA_STATUS_BSY      0x80    /* Busy */
+#define ATA_STATUS_DRDY     0x40    /* Device Ready */
+#define ATA_STATUS_DF       0x20    /* Device Fault */
+#define ATA_STATUS_DRQ      0x08    /* Data Request */
+#define ATA_STATUS_ERR      0x01    /* Error */
+
+/* ATA Device Register bits */
+#define ATA_DEV_LBA         0x40    /* LBA mode (bit 6) */
+
+/* ========================================================================
+ * Port Interrupt Status/Enable Registers
+ * ======================================================================== */
 /* PxIS/PxIE - Port Interrupt Status/Enable ビットマスク */
 #define AHCI_PORT_INT_CPDS  (1 << 31)  /* Cold Port Detect Status */
 #define AHCI_PORT_INT_TFES  (1 << 30)  /* Task File Error Status */

@@ -5,12 +5,25 @@
 AHCI Low Level Driver (ahci_lld)のATAコマンド発行機能の詳細仕様を記述します。
 この機能により、ユーザー空間からIOCTLを通じて任意のATAコマンドを発行できます。
 
+### AHCI/SATA仕様準拠
+
+本機能は以下の仕様に基づいて実装されています：
+
+- **AHCI 1.3.1 Specification**
+  - Section 4.2: System Memory Structure
+  - Section 5: Command List and Command Tables
+  - Section 10.5: FIS Types
+- **SATA 3.x Specification** - Link Layer, Transport Layer
+- **ATA8-ACS** - ATA Command Set
+
 ## 機能一覧
 
 - **汎用ATAコマンド発行**: IDENTIFY DEVICE、READ DMA EXT、WRITE DMA EXTなど
-- **Scatter-Gather DMA転送**: 最大256MBの大容量データ転送対応
+- **Scatter-Gather DMA転送**: 最大256MBの大容量データ転送対応（AHCI PRDT使用）
 - **D2H FIS結果取得**: コマンド完了後のステータス、エラー、LBA、カウント情報
 - **動的バッファ管理**: 転送サイズに応じたDMAバッファの自動割り当て
+- **48-bit LBA対応**: 大容量ドライブ（>137GB）をサポート
+- **タイムアウト制御**: コマンドごとにタイムアウト値を設定可能
 
 ## アーキテクチャ
 

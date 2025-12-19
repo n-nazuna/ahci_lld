@@ -13,9 +13,34 @@
 #define DRIVER_NAME "ahci_lld"
 #define AHCI_MAX_PORTS 32
 
-/* Scatter-Gather configuration */
-#define AHCI_SG_BUFFER_SIZE     (128 * 1024)    /* 128KB per buffer */
-#define AHCI_SG_BUFFER_COUNT    2048            /* Max 2048 buffers = 256MB (4K sector × 65536) */
+/* ========================================================================
+ * Timing Constants (based on AHCI Specification)
+ * ======================================================================== */
+#define AHCI_COMRESET_DELAY_MS          10      /* COMRESET assertion time (min 1ms, spec 10.4.2) */
+#define AHCI_PORT_STOP_TIMEOUT_MS       500     /* Port stop timeout (PxCMD.CR clear) */
+#define AHCI_PORT_START_TIMEOUT_MS      500     /* Port start timeout (PxCMD.FR set) */
+#define AHCI_HBA_RESET_TIMEOUT_MS       1000    /* HBA reset timeout (GHC.HR clear) */
+#define AHCI_CMD_DEFAULT_TIMEOUT_MS     5000    /* Default command completion timeout */
+#define AHCI_PHY_READY_TIMEOUT_MS       1000    /* PHY communication ready timeout */
+#define AHCI_DEVICE_READY_TIMEOUT_MS    1000    /* Device BSY/DRQ clear timeout */
+
+/* ========================================================================
+ * DMA Buffer Configuration (Scatter-Gather)
+ * Based on AHCI 1.3.1 Section 4.2 (Physical Region Descriptor Table)
+ * ======================================================================== */
+#define AHCI_SG_BUFFER_SIZE     (128 * 1024)    /* 128KB per buffer (optimal for large transfers) */
+#define AHCI_SG_BUFFER_COUNT    2048            /* Max 2048 buffers = 256MB max transfer */
+#define AHCI_MAX_TRANSFER_SIZE  (AHCI_SG_BUFFER_SIZE * AHCI_SG_BUFFER_COUNT)
+
+/* AHCI Command Table sizes (AHCI 1.3.1 Section 4.2.3) */
+#define AHCI_CMD_LIST_SIZE      1024            /* Command List: 32 slots × 32 bytes */
+#define AHCI_FIS_AREA_SIZE      256             /* Received FIS area */
+#define AHCI_CMD_TABLE_SIZE     4096            /* Command Table (simplified) */
+#define AHCI_MAX_PRDT_ENTRIES   65535           /* Max PRDT entries per command */
+
+/* Sector size constants */
+#define ATA_SECTOR_SIZE         512             /* Standard ATA sector size */
+#define ATA_SECTOR_SIZE_4K      4096            /* Advanced Format 4K sector */
 
 /* Forward declarations */
 struct ahci_hba;
