@@ -6,6 +6,7 @@
 #include <linux/spinlock.h>
 #include <linux/bitmap.h>
 #include "ahci_lld.h"
+#include "ahci_lld_fis.h"
 
 /**
  * ahci_alloc_slot - Allocate a free command slot
@@ -70,14 +71,7 @@ void ahci_free_slot(struct ahci_port_device *port, int slot)
     atomic_dec(&port->active_slots);
     
     /* Clear slot information */
-    port->slots[slot].req = NULL;
-    port->slots[slot].buffer = NULL;
-    port->slots[slot].buffer_len = 0;
-    port->slots[slot].is_write = false;
-    port->slots[slot].completed = false;
-    port->slots[slot].result = 0;
-    port->slots[slot].sg_start_idx = -1;
-    port->slots[slot].sg_count = 0;
+    memset(&port->slots[slot], 0, sizeof(port->slots[slot]));
     
     spin_unlock_irqrestore(&port->slot_lock, flags);
     
@@ -121,8 +115,9 @@ EXPORT_SYMBOL_GPL(ahci_mark_slot_completed);
  * ahci_check_slot_completion - Check if command slots have completed
  * @port: Port device structure
  *
- * Polls PxCI and PxSACT registers to detect completed commands.
+ * Polls PxSACT register to detect completed NCQ commands.
  * Updates slot completion status accordingly.
+ * This is only used for NCQ (asynchronous) commands.
  *
  * Return: Bitmap of newly completed slots
  */
@@ -130,12 +125,11 @@ u32 ahci_check_slot_completion(struct ahci_port_device *port)
 {
     void __iomem *port_mmio = port->port_mmio;
     unsigned long flags;
-    u32 ci, sact;
+    u32 sact;
     u32 newly_completed = 0;
     int slot;
     
-    /* Read hardware registers */
-    ci = ioread32(port_mmio + AHCI_PORT_CI);
+    /* Read PxSACT register (NCQ active slots) */
     sact = ioread32(port_mmio + AHCI_PORT_SACT);
     
     spin_lock_irqsave(&port->slot_lock, flags);
@@ -151,33 +145,29 @@ u32 ahci_check_slot_completion(struct ahci_port_device *port)
         if (port->slots[slot].completed)
             continue;
         
-        /* Check if slot has completed:
-         * - For non-NCQ: PxCI bit is cleared
-         * - For NCQ: PxSACT bit is cleared
-         */
-        bool completed = false;
-        
-        if (port->ncq_enabled) {
-            /* NCQ: check PxSACT */
-            if (!(sact & slot_bit)) {
-                completed = true;
-            }
-        } else {
-            /* Non-NCQ: check PxCI */
-            if (!(ci & slot_bit)) {
-                completed = true;
-            }
-        }
-        
-        if (completed) {
+        /* Check if NCQ slot has completed (PxSACT bit cleared) */
+        if (!(sact & slot_bit)) {
+            /* NCQ: Read SDB (Set Device Bits) FIS */
+            struct fis_set_dev_bits *sdb_fis;
+            sdb_fis = (struct fis_set_dev_bits *)((u8 *)port->fis_area + AHCI_RX_FIS_SDB);
+            
+            /* SDB FIS contains the actual status value */
+            port->slots[slot].req.status = sdb_fis->status;
+            port->slots[slot].req.error = sdb_fis->error;
+            port->slots[slot].req.device_out = 0;  /* SDB FIS doesn't have device */
+            
+            /* SDB FIS doesn't contain LBA/count, keep original values */
+            port->slots[slot].req.lba_out = port->slots[slot].req.lba;
+            port->slots[slot].req.count_out = port->slots[slot].req.count;
+            
             set_bit(slot, &port->slots_completed);
             port->slots[slot].completed = true;
             port->slots[slot].result = 0;
             port->ncq_completed++;
             newly_completed |= slot_bit;
             
-            dev_dbg(port->device, "Slot %d completed (CI=0x%08x, SACT=0x%08x)\n",
-                    slot, ci, sact);
+            dev_dbg(port->device, "Slot %d completed: status=0x%02x error=0x%02x (SACT=0x%08x)\n",
+                    slot, port->slots[slot].req.status, port->slots[slot].req.error, sact);
         }
     }
     

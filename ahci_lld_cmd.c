@@ -294,12 +294,23 @@ int ahci_port_issue_cmd_async(struct ahci_port_device *port,
         port->ncq_enabled = true;
     }
     
-    /* Allocate a slot */
-    slot = ahci_alloc_slot(port);
-    if (slot < 0) {
-        dev_err(port->device, "Failed to allocate slot\n");
-        return slot;
+    /* Use user-specified tag as slot number */
+    slot = req->tag;
+    if (slot < 0 || slot >= 32) {
+        dev_err(port->device, "Invalid tag/slot number: %d\n", slot);
+        return -EINVAL;
     }
+    
+    /* Check if slot is already in use */
+    spin_lock_irqsave(&port->slot_lock, flags);
+    if (test_bit(slot, &port->slots_in_use)) {
+        spin_unlock_irqrestore(&port->slot_lock, flags);
+        dev_err(port->device, "Slot %d already in use\n", slot);
+        return -EBUSY;
+    }
+    set_bit(slot, &port->slots_in_use);
+    atomic_inc(&port->active_slots);
+    spin_unlock_irqrestore(&port->slot_lock, flags);
     
     /* Check if port is started */
     cmd_stat = ioread32(port_mmio + AHCI_PORT_CMD);
@@ -311,9 +322,9 @@ int ahci_port_issue_cmd_async(struct ahci_port_device *port,
     
     is_write = (req->flags & AHCI_CMD_FLAG_WRITE) ? true : false;
     
-    /* Store slot information */
+    /* Store slot information - copy the request structure */
     spin_lock_irqsave(&port->slot_lock, flags);
-    port->slots[slot].req = req;
+    port->slots[slot].req = *req;  /* Copy the entire structure */
     port->slots[slot].buffer = buf;
     port->slots[slot].buffer_len = req->buffer_len;
     port->slots[slot].is_write = is_write;
@@ -419,9 +430,10 @@ int ahci_port_issue_cmd_async(struct ahci_port_device *port,
         cmd_hdr->prdtl = 0;
     }
     
-    /* Issue command */
+    /* Issue command (NCQ uses both PxSACT and PxCI) */
     wmb();  /* Ensure all writes are visible */
-    iowrite32(1 << slot, port_mmio + AHCI_PORT_CI);
+    iowrite32(1 << slot, port_mmio + AHCI_PORT_SACT);  /* Set PxSACT for NCQ */
+    iowrite32(1 << slot, port_mmio + AHCI_PORT_CI);    /* Set PxCI to issue command */
     
     /* Update statistics */
     port->ncq_issued++;
@@ -429,7 +441,7 @@ int ahci_port_issue_cmd_async(struct ahci_port_device *port,
     /* Return assigned tag */
     req->tag = slot;
     
-    dev_info(port->device, "Async command 0x%02x issued on slot %d\n", req->command, slot);
+    dev_info(port->device, "NCQ command 0x%02x issued on slot %d\n", req->command, slot);
     
     return 0;
 }

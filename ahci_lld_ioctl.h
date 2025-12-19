@@ -58,7 +58,7 @@ struct ahci_cmd_request {
 /* コマンドフラグ */
 #define AHCI_CMD_FLAG_WRITE     (1 << 0)  /* Write direction */
 #define AHCI_CMD_FLAG_ATAPI     (1 << 1)  /* ATAPI command */
-#define AHCI_CMD_FLAG_ASYNC     (1 << 2)  /* Async execution (NCQ) */
+#define AHCI_CMD_FLAG_NCQ       (1 << 2)  /* NCQ (Native Command Queuing) */
 #define AHCI_CMD_FLAG_PREFETCH  (1 << 3)  /* Prefetchable */
 
 /* Set Device Bits 構造体 - NCQ完了情報 */

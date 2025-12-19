@@ -131,8 +131,8 @@ static long ahci_lld_ioctl(struct file *file, unsigned int cmd,
         }
         
         /* コマンド発行 */
-        if (req.flags & AHCI_CMD_FLAG_ASYNC) {
-            /* 非同期実行 */
+        if (req.flags & AHCI_CMD_FLAG_NCQ) {
+            /* NCQ非同期実行 */
             ret = ahci_port_issue_cmd_async(port_dev, &req, data_buf);
             if (ret == 0) {
                 /* tagだけを返す（データはまだコピーしない） */
@@ -168,9 +168,6 @@ static long ahci_lld_ioctl(struct file *file, unsigned int cmd,
             if (data_buf)
                 kfree(data_buf);
         }
-        
-        if (data_buf)
-            kfree(data_buf);
         break;
     }
     
@@ -199,16 +196,12 @@ static long ahci_lld_ioctl(struct file *file, unsigned int cmd,
                 /* Mark as completed in SDB */
                 sdb.completed |= (1 << tag);
                 
-                /* Copy status/error */
-                if (port_dev->slots[tag].req) {
-                    sdb.status[tag] = port_dev->slots[tag].req->status;
-                    sdb.error[tag] = port_dev->slots[tag].req->error;
-                }
+                /* Copy status/error from the slot's request structure */
+                sdb.status[tag] = port_dev->slots[tag].req.status;
+                sdb.error[tag] = port_dev->slots[tag].req.error;
                 
                 /* Buffer pointer (user space address) */
-                if (port_dev->slots[tag].req) {
-                    sdb.buffer[tag] = port_dev->slots[tag].req->buffer;
-                }
+                sdb.buffer[tag] = port_dev->slots[tag].req.buffer;
                 
                 /* Clear completed flag (so it won't be returned again) */
                 port_dev->slots[tag].completed = false;
@@ -227,7 +220,7 @@ static long ahci_lld_ioctl(struct file *file, unsigned int cmd,
                     continue;
                 
                 /* Copy from kernel buffer to user buffer */
-                if (copy_to_user((void __user *)slot->req->buffer, 
+                if (copy_to_user((void __user *)slot->req.buffer, 
                                  slot->buffer, slot->buffer_len)) {
                     dev_err(port_dev->device, "Failed to copy data to user for slot %d\n", tag);
                     sdb.status[tag] = 0xFF;  /* Mark error */

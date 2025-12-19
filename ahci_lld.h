@@ -65,7 +65,7 @@ struct ahci_hba {
 
 /* NCQ Slot Information */
 struct ahci_cmd_slot {
-    struct ahci_cmd_request *req;   /* Command request */
+    struct ahci_cmd_request req;    /* Command request (stored copy) */
     void *buffer;                   /* Kernel buffer */
     u32 buffer_len;                 /* Buffer length */
     bool is_write;                  /* Write direction flag */
