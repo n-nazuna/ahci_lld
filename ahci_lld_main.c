@@ -131,21 +131,42 @@ static long ahci_lld_ioctl(struct file *file, unsigned int cmd,
         }
         
         /* コマンド発行 */
-        ret = ahci_port_issue_cmd(port_dev, &req, data_buf);
-        if (ret == 0) {
-            /* Read direction の場合はユーザーバッファへコピー */
-            if (!(req.flags & AHCI_CMD_FLAG_WRITE) && req.buffer_len > 0) {
-                if (copy_to_user((void __user *)req.buffer, data_buf, req.buffer_len)) {
-                    dev_err(port_dev->device, "Failed to copy result to user\n");
+        if (req.flags & AHCI_CMD_FLAG_ASYNC) {
+            /* 非同期実行 */
+            ret = ahci_port_issue_cmd_async(port_dev, &req, data_buf);
+            if (ret == 0) {
+                /* tagだけを返す（データはまだコピーしない） */
+                if (copy_to_user((void __user *)arg, &req, sizeof(req))) {
+                    dev_err(port_dev->device, "Failed to copy tag to user\n");
+                    ret = -EFAULT;
+                }
+            } else {
+                /* エラー時はバッファを解放 */
+                if (data_buf)
+                    kfree(data_buf);
+            }
+        } else {
+            /* 同期実行（既存の動作） */
+            ret = ahci_port_issue_cmd(port_dev, &req, data_buf);
+            if (ret == 0) {
+                /* Read direction の場合はユーザーバッファへコピー */
+                if (!(req.flags & AHCI_CMD_FLAG_WRITE) && req.buffer_len > 0) {
+                    if (copy_to_user((void __user *)req.buffer, data_buf, req.buffer_len)) {
+                        dev_err(port_dev->device, "Failed to copy result to user\n");
+                        ret = -EFAULT;
+                    }
+                }
+                
+                /* 結果フィールド (status, error, etc) をユーザー空間へコピー */
+                if (copy_to_user((void __user *)arg, &req, sizeof(req))) {
+                    dev_err(port_dev->device, "Failed to copy result fields to user\n");
                     ret = -EFAULT;
                 }
             }
             
-            /* 結果フィールド (status, error, etc) をユーザー空間へコピー */
-            if (copy_to_user((void __user *)arg, &req, sizeof(req))) {
-                dev_err(port_dev->device, "Failed to copy result fields to user\n");
-                ret = -EFAULT;
-            }
+            /* 同期実行ではバッファをすぐに解放 */
+            if (data_buf)
+                kfree(data_buf);
         }
         
         if (data_buf)
@@ -195,6 +216,29 @@ static long ahci_lld_ioctl(struct file *file, unsigned int cmd,
         }
         
         spin_unlock_irqrestore(&port_dev->slot_lock, flags);
+        
+        /* Copy data back to user buffers for READ operations */
+        for (tag = 0; tag < 32; tag++) {
+            if (sdb.completed & (1 << tag)) {
+                struct ahci_cmd_slot *slot = &port_dev->slots[tag];
+                
+                /* Skip if WRITE or no buffer */
+                if (slot->is_write || !slot->buffer || slot->buffer_len == 0)
+                    continue;
+                
+                /* Copy from kernel buffer to user buffer */
+                if (copy_to_user((void __user *)slot->req->buffer, 
+                                 slot->buffer, slot->buffer_len)) {
+                    dev_err(port_dev->device, "Failed to copy data to user for slot %d\n", tag);
+                    sdb.status[tag] = 0xFF;  /* Mark error */
+                    sdb.error[tag] = 0xFF;
+                }
+                
+                /* Free kernel buffer after copy */
+                kfree(slot->buffer);
+                slot->buffer = NULL;
+            }
+        }
         
         /* Copy result to user space */
         if (copy_to_user((void __user *)arg, &sdb, sizeof(sdb))) {
