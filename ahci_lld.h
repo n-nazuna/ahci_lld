@@ -162,4 +162,10 @@ int ahci_port_issue_cmd(struct ahci_port_device *port,
                         struct ahci_cmd_request *req, void *buf);
 int ahci_port_issue_identify(struct ahci_port_device *port, void *buf);
 
+/* ahci_lld_slot.c からエクスポートされるスロット管理関数 */
+int ahci_alloc_slot(struct ahci_port_device *port);
+void ahci_free_slot(struct ahci_port_device *port, int slot);
+void ahci_mark_slot_completed(struct ahci_port_device *port, int slot, int result);
+u32 ahci_check_slot_completion(struct ahci_port_device *port);
+
 #endif /* AHCI_LLD_H */

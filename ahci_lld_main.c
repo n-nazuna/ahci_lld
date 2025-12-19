@@ -164,15 +164,18 @@ static long ahci_lld_ioctl(struct file *file, unsigned int cmd,
         
         memset(&sdb, 0, sizeof(sdb));
         
+        /* Check hardware for newly completed commands */
+        ahci_check_slot_completion(port_dev);
+        
         spin_lock_irqsave(&port_dev->slot_lock, flags);
         
         /* Read PxSACT (currently active slots) */
         sdb.sactive = ioread32(port_dev->port_mmio + AHCI_PORT_SACT);
         
-        /* Check completed slots */
+        /* Collect completed slots */
         for (tag = 0; tag < 32; tag++) {
             if (port_dev->slots[tag].completed) {
-                /* Mark as completed */
+                /* Mark as completed in SDB */
                 sdb.completed |= (1 << tag);
                 
                 /* Copy status/error */
