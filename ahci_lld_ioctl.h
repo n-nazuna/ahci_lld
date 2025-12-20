@@ -24,6 +24,9 @@
 /* NCQ Command Completion Probe */
 #define AHCI_IOC_PROBE_CMD      _IOR(AHCI_LLD_IOC_MAGIC, 11, struct ahci_sdb)
 
+/* Free Command Slot */
+#define AHCI_IOC_FREE_SLOT      _IOW(AHCI_LLD_IOC_MAGIC, 12, int)
+
 /* Read Dump */
 #define AHCI_IOC_READ_REGS      _IOR(AHCI_LLD_IOC_MAGIC, 20, struct ahci_port_regs)
 

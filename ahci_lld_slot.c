@@ -149,6 +149,10 @@ u32 ahci_check_slot_completion(struct ahci_port_device *port)
         if (!(sact & slot_bit)) {
             /* NCQ: Read SDB (Set Device Bits) FIS */
             struct fis_set_dev_bits *sdb_fis;
+            void *buffer_to_copy = NULL;
+            void __user *user_buffer = NULL;
+            size_t copy_len = 0;
+            
             sdb_fis = (struct fis_set_dev_bits *)((u8 *)port->fis_area + AHCI_RX_FIS_SDB);
             
             /* SDB FIS contains the actual status value */
@@ -160,6 +164,14 @@ u32 ahci_check_slot_completion(struct ahci_port_device *port)
             port->slots[slot].req.lba_out = port->slots[slot].req.lba;
             port->slots[slot].req.count_out = port->slots[slot].req.count;
             
+            /* Prepare copy parameters while holding lock */
+            if (!port->slots[slot].is_write && port->slots[slot].buffer && 
+                port->slots[slot].buffer_len > 0) {
+                buffer_to_copy = port->slots[slot].buffer;
+                user_buffer = (void __user *)port->slots[slot].req.buffer;
+                copy_len = port->slots[slot].buffer_len;
+            }
+            
             set_bit(slot, &port->slots_completed);
             port->slots[slot].completed = true;
             port->slots[slot].result = 0;
@@ -168,6 +180,19 @@ u32 ahci_check_slot_completion(struct ahci_port_device *port)
             
             dev_dbg(port->device, "Slot %d completed: status=0x%02x error=0x%02x (SACT=0x%08x)\n",
                     slot, port->slots[slot].req.status, port->slots[slot].req.error, sact);
+            
+            /* Copy data to user after releasing lock */
+            if (buffer_to_copy) {
+                spin_unlock_irqrestore(&port->slot_lock, flags);
+                if (copy_to_user(user_buffer, buffer_to_copy, copy_len)) {
+                    dev_err(port->device, "Failed to copy data to user for slot %d\n", slot);
+                    spin_lock_irqsave(&port->slot_lock, flags);
+                    port->slots[slot].req.status = 0xFF;
+                    port->slots[slot].req.error = 0xFF;
+                } else {
+                    spin_lock_irqsave(&port->slot_lock, flags);
+                }
+            }
         }
     }
     

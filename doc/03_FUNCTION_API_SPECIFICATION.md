@@ -333,55 +333,87 @@ int ahci_port_issue_cmd(struct ahci_port_device *port,
                         void *buf);
 ```
 
-**目的:** ATAコマンドを同期的に実行（Non-NCQ）
+**目的:** ATAコマンドを発行（NCQ/Non-NCQ両対応）
 
 **パラメータ:**
 - `port`: ポートデバイス構造体ポインタ
 - `req`: コマンドリクエスト構造体（入出力）
 - `buf`: データバッファ（カーネル空間、READの場合結果格納）
 
-**動作:**
-1. ポート開始確認（`PxCMD.ST=1`）
-2. スロット0のコマンドヘッダ設定
+**動作モード:**
+
+NCQフラグ（`AHCI_CMD_FLAG_NCQ`）により動作が変わります：
+
+#### Non-NCQモード（フラグなし）
+1. **常にスロット0を使用**（ハードコード、`slot = 0`）
+2. ポート開始確認（`PxCMD.ST=1`）
+3. コマンドヘッダ設定（slot 0）
    - FIS長=5 DWORDs
    - Wビット（書き込みの場合）
    - PRDTL=SGバッファ数
-   - CTBA=コマンドテーブルDMAアドレス
-3. Command FIS（H2D）構築
+   - CTBA=コマンドテーブルDMAアドレス（slot 0専用）
+4. Command FIS（H2D）構築
    - FISタイプ=0x27
    - コマンドビット=1
    - ATA command, device, LBA, count, features設定
-4. PRDT構築
+5. PRDT構築
    - WRITEの場合: `buf`からSGバッファへコピー
    - 各PRDTエントリにSGバッファDMAアドレス設定
-5. `PxIS`クリア
-6. コマンド発行（`PxCI`ビット0を1に）
-7. 完了待機（`PxCI`ビット0が0になるまでポーリング）
+6. `PxIS`クリア
+7. コマンド発行（`PxCI`ビット0を1に）
+8. **完了待機**（`PxCI`ビット0が0になるまでポーリング）
    - 1msごとにチェック
    - `timeout_ms`でタイムアウト
    - `PxIS`でエラーチェック（TFES, HBFS, IFS）
-8. 結果読み取り（D2H FIS、オフセット0x40）
+9. **結果読み取り**（D2H FIS、オフセット0x40）
    - status, error, device, LBA, count抽出
-9. READの場合: SGバッファから`buf`へコピー
+10. READの場合: SGバッファから`buf`へコピー
+11. **スロット0を自動解放**（`ahci_free_slot(port, 0)`呼び出し）
+12. `PxIS`クリア
+
+#### NCQモード（フラグあり）
+1. `req->tag`でスロット番号指定（0-31）
+2. スロット空き確認
+   - `slots_in_use`ビットマップでチェック
+   - 使用中の場合`-EBUSY`
+3. スロットマーク（使用中に設定）
+4. スロット情報保存（リクエストコピー、バッファポインタ保存）
+5. NCQモード有効化（初回のみ）
+6. コマンドテーブル割り当て（未割り当ての場合）
+7. コマンドヘッダ設定（指定slot）
+8. Command FIS（H2D）構築
+9. PRDT構築
 10. `PxIS`クリア
+11. NCQコマンド発行
+    - **`PxSACT`にスロットビット設定**
+    - `PxCI`にスロットビット設定
+12. **キューイング完了待機**（`PxCI`の該当ビットが0になるまで）
+    - キューイング完了時点でリターン
+    - **転送完了は非同期**（SDB FISで後から通知）
+    - D2H FISは読み取らない
 
 **戻り値:**
 - `0`: 成功
-- `-EINVAL`: 無効なパラメータ（ポート未開始等）
-- `-ENOMEM`: SGバッファ割り当て失敗
+  - Non-NCQ: 転送完了、結果を`req`に格納
+  - NCQ: キューイング完了、`req->tag`にスロット番号
+- `-EINVAL`: 無効なパラメータ（ポート未開始、無効なtag等）
+- `-EBUSY`: スロット使用中（NCQのみ）
+- `-ENOMEM`: SGバッファまたはコマンドテーブル割り当て失敗
 - `-ETIMEDOUT`: コマンドタイムアウト
-- `-EIO`: ハードウェアI/Oエラー
+- `-EIO`: ハードウェアI/Oエラー（Non-NCQのみ）
 
 **副作用:**
-- スロット0を占有（完了まで他のコマンド発行不可）
+- Non-NCQ: スロット0を占有（完了まで他のコマンド発行不可）、**完了時に自動解放**
+- NCQ: 指定スロットを占有（tag上書きまたは`ahci_free_slot()`で解放）
 - SGバッファ使用
 
 **注意事項:**
-- ブロッキング関数（完了まで待機）
-- スロット0専用（Non-NCQ）
+- Non-NCQ: ブロッキング関数（転送完了まで待機）、スロット0は完了時に自動解放
+- NCQ: ブロッキング関数（キューイング完了まで待機、転送は非同期）
 - `buf`はカーネル空間ポインタ
+- NCQの場合、同じtagで再発行すると古いバッファを自動破棄
 
-**使用例:**
+**使用例（Non-NCQ）:**
 ```c
 struct ahci_cmd_request req;
 uint8_t buffer[512];
@@ -392,6 +424,8 @@ req.device = 0x40;
 req.lba = 0x1000;
 req.count = 1;
 req.timeout_ms = 5000;
+req.buffer_len = 512;
+/* NCQフラグなし */
 
 ret = ahci_port_issue_cmd(port, &req, buffer);
 if (ret) {
@@ -402,63 +436,7 @@ if (ret) {
 }
 ```
 
-**呼び出し元:** IOCTLハンドラ `AHCI_IOC_ISSUE_CMD`（同期モード）
-
----
-
-### ahci_port_issue_cmd_async
-
-**宣言:**
-```c
-int ahci_port_issue_cmd_async(struct ahci_port_device *port,
-                               struct ahci_cmd_request *req,
-                               void *buf);
-```
-
-**目的:** NCQコマンドを非同期的に発行
-
-**パラメータ:**
-- `port`: ポートデバイス構造体ポインタ
-- `req`: コマンドリクエスト（`req->tag`でスロット指定）
-- `buf`: データバッファ（カーネル空間）
-
-**動作:**
-1. NCQモード有効化（初回のみ）
-2. ユーザ指定タグ検証（0-31）
-3. スロット空き確認
-   - `slots_in_use`ビットマップでチェック
-   - 使用中の場合`-EBUSY`
-4. スロットマーク（使用中に設定）
-5. スロット情報保存
-   - リクエストコピー
-   - バッファポインタ保存
-6. コマンドテーブル割り当て（未割り当ての場合）
-7. コマンドヘッダ設定
-8. Command FIS（H2D）構築
-   - ユーザ指定の`req->count`, `req->features`をそのまま使用
-9. PRDT構築
-   - WRITEの場合: データコピー
-10. NCQコマンド発行
-    - `PxSACT`にスロットビット設定
-    - `PxCI`にスロットビット設定
-11. **即座にリターン**（完了待機なし）
-
-**戻り値:**
-- `0`: 成功（コマンド発行完了、実行は非同期）
-- `-EINVAL`: 無効なタグ
-- `-EBUSY`: スロット使用中
-- `-ENOMEM`: コマンドテーブル割り当て失敗
-
-**副作用:**
-- スロットを占有（`ahci_free_slot()`で解放必要）
-- バッファはコマンド完了まで保持される
-
-**注意事項:**
-- ノンブロッキング（即座にリターン）
-- 完了確認は`ahci_check_slot_completion()`で行う
-- `buf`の寿命管理はドライバ責任
-
-**使用例:**
+**使用例（NCQ）:**
 ```c
 struct ahci_cmd_request req;
 uint8_t *buffer = kmalloc(512, GFP_KERNEL);
@@ -470,19 +448,20 @@ req.device = 0x40;
 req.lba = 0x1000;
 req.count = (5 << 3);      /* Tag 5 in bits 7:3 */
 req.tag = 5;               /* Slot number */
+req.buffer_len = 512;
 req.flags = AHCI_CMD_FLAG_NCQ;
 
-ret = ahci_port_issue_cmd_async(port, &req, buffer);
+ret = ahci_port_issue_cmd(port, &req, buffer);
 if (ret) {
     kfree(buffer);
-    dev_err(port->device, "NCQ issue failed: %d\n", ret);
+    dev_err(port->device, "NCQ queueing failed: %d\n", ret);
 } else {
-    /* Command issued, will complete asynchronously */
+    /* Command queued, will complete asynchronously */
     /* Must call ahci_check_slot_completion() later */
 }
 ```
 
-**呼び出し元:** IOCTLハンドラ `AHCI_IOC_ISSUE_CMD`（NCQモード）
+**呼び出し元:** IOCTLハンドラ `AHCI_IOC_ISSUE_CMD`
 
 ---
 
@@ -529,7 +508,7 @@ pr_info("Allocated slot %d\n", slot);
 
 **呼び出し元:** 
 - （現在は未使用、将来の自動割り当て用）
-- `ahci_port_issue_cmd_async()`は`req->tag`を直接使用
+- `ahci_port_issue_cmd()`は`req->tag`を直接使用（NCQモード時）
 
 ---
 
@@ -567,7 +546,9 @@ void ahci_free_slot(struct ahci_port_device *port, int slot);
 ahci_free_slot(port, slot);
 ```
 
-**呼び出し元:** IOCTLハンドラ `AHCI_IOC_PROBE_CMD`（完了後）
+**呼び出し元:** 
+- IOCTLハンドラ `AHCI_IOC_FREE_SLOT`（明示的解放）
+- `ahci_port_issue_cmd()`（Non-NCQ完了時、NCQ tag上書き時）
 
 ---
 
@@ -808,7 +789,6 @@ if (ret) {
 
 **呼び出し元:** 
 - `ahci_port_issue_cmd()`
-- `ahci_port_issue_cmd_async()`
 
 ---
 

@@ -160,8 +160,6 @@ int ahci_port_ensure_sg_buffers(struct ahci_port_device *port, int needed);
 /* ahci_lld_cmd.c からエクスポートされるコマンド実行関数 */
 int ahci_port_issue_cmd(struct ahci_port_device *port, 
                         struct ahci_cmd_request *req, void *buf);
-int ahci_port_issue_cmd_async(struct ahci_port_device *port,
-                               struct ahci_cmd_request *req, void *buf);
 
 /* ahci_lld_slot.c からエクスポートされるスロット管理関数 */
 int ahci_alloc_slot(struct ahci_port_device *port);

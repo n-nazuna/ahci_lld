@@ -207,7 +207,7 @@ struct ahci_cmd_request {
 **同期モード（Non-NCQ）:**
 - `flags`に`AHCI_CMD_FLAG_NCQ`を設定**しない**
 - コマンド完了まで待機（ブロッキング）
-- スロット0を使用
+- **常にスロット0を使用**（固定）
 - 戻り値として完了ステータス取得
 
 **非同期モード（NCQ）:**
@@ -324,9 +324,10 @@ struct ahci_sdb {
 2. 使用中スロットをスキャン
 3. PxSACTでクリアされたスロット = 完了
 4. SDB FIS（オフセット0x58）からステータス/エラー読み取り
-5. 完了スロットのビットマップを返す
-6. **READコマンドの場合**: カーネルバッファからユーザバッファへデータコピー
-7. カーネルバッファを解放
+5. **READコマンドの場合**: カーネルバッファからユーザバッファへデータコピー（完了検出時に自動実行）
+6. 完了スロットのビットマップと情報を返す
+
+**注意**: カーネルバッファは解放されません。次回の`AHCI_IOC_ISSUE_CMD`で同じtagを使用すると、自動的に破棄されます。
 
 #### 戻り値
 
@@ -370,8 +371,8 @@ while (1) {
 - ノンブロッキング（即座にリターン）
 - 完了コマンドがない場合、`completed=0`で正常リターン
 - 同じスロットは一度しか`completed`に現れない
-- READデータはこの時点でユーザバッファにコピーされる
-- スロットのバッファは自動的に解放される
+- **READデータは完了検出時に自動コピー済み**（`ahci_check_slot_completion`内で実行）
+- **バッファ解放は行わない** - 次回の`AHCI_IOC_ISSUE_CMD`（tag上書き時）または`AHCI_IOC_FREE_SLOT`で解放
 
 ---
 
@@ -394,6 +395,87 @@ while (1) {
 **注意:**
 - 将来の拡張用プレースホルダー
 - デバッグ目的で全ポートレジスタを一括取得予定
+
+---
+
+### 6. AHCI_IOC_FREE_SLOT
+
+**定義:**
+```c
+#define AHCI_IOC_FREE_SLOT _IOW('A', 12, int)
+```
+
+**目的:** NCQスロットの解放とバッファクリーンアップ
+
+**パラメータ:** `int` (スロット番号 0-31)
+
+#### 動作
+
+1. スロット番号の妥当性チェック（0-31範囲）
+2. スロット使用中フラグ確認
+3. 関連するカーネルバッファ（`slot->buffer`）を解放
+4. スロット管理ビットマップ（`slots_in_use`）をクリア
+5. アクティブスロットカウンタをデクリメント
+6. スロット情報をゼロクリア
+
+**注意:** Non-NCQコマンドは常にスロット0を使用します。Non-NCQコマンド完了時に自動的に解放されます。
+
+#### メモリ管理
+
+- NCQコマンド発行時に確保されたカーネルバッファ（`kmalloc`）を解放
+- SGバッファ（DMA用）は解放**しない**（再利用される）
+- コマンドテーブル（`cmd_tables[slot]`）も解放しない（永続的）
+
+#### 戻り値
+
+- `0`: 成功
+- `-EFAULT`: パラメータ取得失敗
+
+#### 使用タイミング
+
+**必須ではない**が、以下の場合に使用を推奨：
+
+1. **長時間未使用スロット**: 完了後すぐに再利用しない場合
+2. **メモリ節約**: メモリ使用量を最小化したい場合
+3. **エラーリカバリ**: 異常終了したスロットのクリーンアップ
+
+**自動解放タイミング:**
+
+- **Non-NCQ完了時**: スロット0が自動的に解放される（`ahci_port_issue_cmd`内）
+- **NCQ tag上書き時**: 同じスロット番号で新しいNCQコマンドを発行すると、古いバッファを自動破棄
+- **Probe後の再利用**: 完了したNCQスロットは次回Issue時に自動的にクリーンアップ
+
+#### 使用例
+
+```c
+struct ahci_sdb sdb;
+
+/* Probe for completion */
+if (ioctl(fd, AHCI_IOC_PROBE_CMD, &sdb) < 0) {
+    perror("Probe failed");
+}
+
+/* Process completed commands */
+for (int slot = 0; slot < 32; slot++) {
+    if (sdb.completed & (1 << slot)) {
+        printf("Slot %d completed\n", slot);
+        
+        /* Option 1: Explicitly free slot */
+        if (ioctl(fd, AHCI_IOC_FREE_SLOT, &slot) < 0) {
+            perror("Free slot failed");
+        }
+        
+        /* Option 2: Let it auto-free on next Issue (recommended) */
+    }
+}
+```
+
+#### 注意事項
+
+- **通常は不要**: tag上書き時の自動破棄で十分
+- **早期解放**: メモリを即座に解放したい場合に使用
+- **スロット再利用**: FREE_SLOT後、そのスロットは即座に再利用可能
+- **完了前の解放**: 実行中のコマンドには使用しない（未定義動作）
 
 ---
 
@@ -598,6 +680,116 @@ int main(void)
 - 各ポートデバイスは複数プロセスから同時にオープン可能
 - ただし、同期が必要（カーネル内部でロックなし）
 - 推奨: 1プロセス1ポート
+
+---
+
+## NCQバッファのメモリライフサイクル
+
+NCQコマンドのバッファ管理は以下のライフサイクルに従います：
+
+### バッファ確保（AHCI_IOC_ISSUE_CMD時）
+
+```c
+/* 新規NCQコマンド発行時 */
+req.tag = 5;  /* スロット5を使用 */
+req.flags = AHCI_CMD_FLAG_NCQ;
+req.buffer_len = 512;
+
+ioctl(fd, AHCI_IOC_ISSUE_CMD, &req);
+```
+
+**動作（NCQの場合）:**
+1. `tag=5`が既に使用中かチェック
+2. **古いバッファが存在する場合**: `kfree(slots[5].buffer)` で自動破棄
+3. **古いスロット管理をクリア**: `ahci_free_slot(port, 5)` で解放
+4. 新しいバッファを`kmalloc(512, GFP_KERNEL)`で確保
+5. WRITEの場合: ユーザバッファからコピー
+6. 新しいスロットを確保（`ahci_alloc_slot`）
+7. DMA転送開始（即座にreturn）
+
+**動作（Non-NCQの場合）:**
+1. **常にスロット0を使用**（固定、ハードコード）
+2. バッファを`kmalloc`で確保
+3. WRITEの場合: ユーザバッファからコピー
+4. DMA転送開始・完了待機（ブロッキング）
+5. **完了後に自動的に`ahci_free_slot(port, 0)`を呼び出し**
+6. READの場合: ユーザバッファへコピー
+7. バッファを`kfree`して返却
+
+### データ転送完了（AHCI_IOC_PROBE_CMD時）
+
+```c
+struct ahci_sdb sdb;
+ioctl(fd, AHCI_IOC_PROBE_CMD, &sdb);
+
+if (sdb.completed & (1 << 5)) {
+    /* スロット5完了 */
+    /* READデータは既にユーザバッファにコピー済み */
+}
+```
+
+**動作:**
+1. `ahci_check_slot_completion()`内で完了検出
+2. **READの場合**: `copy_to_user()`で自動コピー
+3. ステータス/エラー情報を設定
+4. **バッファは保持したまま**（解放しない）
+
+### バッファ解放（2つの方法）
+
+#### 方法1: 自動解放（推奨）
+
+**Non-NCQ:**
+```c
+/* Non-NCQコマンドは常に自動解放 */
+req.command = 0x25;  /* READ DMA EXT */
+req.flags = 0;       /* Non-NCQ */
+ioctl(fd, AHCI_IOC_ISSUE_CMD, &req);
+/* → 完了後、スロット0が自動的に解放される */
+```
+
+**NCQ tag上書き:**
+```c
+/* 同じtagで新しいコマンド発行 */
+req.tag = 5;  /* 前回と同じtag */
+req.flags = AHCI_CMD_FLAG_NCQ;
+ioctl(fd, AHCI_IOC_ISSUE_CMD, &req);
+/* → 古いslots[5]が自動的に解放される */
+```
+
+#### 方法2: 明示的解放（オプション）
+
+```c
+int slot = 5;
+ioctl(fd, AHCI_IOC_FREE_SLOT, &slot);
+/* → すぐにメモリ解放（NCQのみ） */
+```
+
+**注意:** スロット0への明示的FREE_SLOTは不要です（Non-NCQは自動管理）。ただし、NCQで`tag=0`を使用した場合は、FREE_SLOTまたはtag上書きで解放できます。
+
+### メモリリーク防止
+
+- **Non-NCQ**: 完了時に自動的にスロット0を解放（ユーザ操作不要）
+- **NCQ tag再利用**: 同じtagで新規Issue → 自動破棄で100%安全
+- **NCQ FREE_SLOT**: 長期間未使用のtagを明示的に解放（オプション）
+- **ドライバアンロード**: 全スロットのバッファを自動解放
+
+### 推奨使用パターン
+
+```c
+/* ループ内でNCQを継続的に使用 */
+for (int i = 0; i < 1000; i++) {
+    int tag = i % 32;  /* 32スロットを循環利用 */
+    
+    /* 1. コマンド発行（tag再利用で自動クリーンアップ） */
+    req.tag = tag;
+    ioctl(fd, AHCI_IOC_ISSUE_CMD, &req);
+    
+    /* 2. 完了確認（データは自動コピー済み） */
+    ioctl(fd, AHCI_IOC_PROBE_CMD, &sdb);
+    
+    /* 3. FREE_SLOTは不要（次回Issueで自動破棄される） */
+}
+```
 
 ---
 

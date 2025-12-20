@@ -113,6 +113,21 @@ static long ahci_lld_ioctl(struct file *file, unsigned int cmd,
                 break;
             }
             
+            /* NCQの場合、tag上書き時に前回のスロットを破棄 */
+            if (req.flags & AHCI_CMD_FLAG_NCQ) {
+                int tag = req.tag;
+                if (tag >= 0 && tag < 32) {
+                    struct ahci_cmd_slot *slot = &port_dev->slots[tag];
+                    if (slot->buffer) {
+                        dev_dbg(port_dev->device, "Freeing old slot for tag %d before reuse\n", tag);
+                        kfree(slot->buffer);
+                        slot->buffer = NULL;
+                    }
+                    /* スロット自体も解放（slots_in_useビットをクリア） */
+                    ahci_free_slot(port_dev, tag);
+                }
+            }
+            
             data_buf = kmalloc(req.buffer_len, GFP_KERNEL);
             if (!data_buf) {
                 ret = -ENOMEM;
@@ -130,26 +145,17 @@ static long ahci_lld_ioctl(struct file *file, unsigned int cmd,
             }
         }
         
-        /* コマンド発行 */
-        if (req.flags & AHCI_CMD_FLAG_NCQ) {
-            /* NCQ非同期実行 */
-            ret = ahci_port_issue_cmd_async(port_dev, &req, data_buf);
-            if (ret == 0) {
-                /* tagだけを返す（データはまだコピーしない） */
+        /* コマンド発行（NCQ/Non-NCQ統合） */
+        ret = ahci_port_issue_cmd(port_dev, &req, data_buf);
+        if (ret == 0) {
+            if (req.flags & AHCI_CMD_FLAG_NCQ) {
+                /* NCQ: tagだけを返す（データはまだコピーしない） */
                 if (copy_to_user((void __user *)arg, &req, sizeof(req))) {
                     dev_err(port_dev->device, "Failed to copy tag to user\n");
                     ret = -EFAULT;
                 }
             } else {
-                /* エラー時はバッファを解放 */
-                if (data_buf)
-                    kfree(data_buf);
-            }
-        } else {
-            /* 同期実行（既存の動作） */
-            ret = ahci_port_issue_cmd(port_dev, &req, data_buf);
-            if (ret == 0) {
-                /* Read direction の場合はユーザーバッファへコピー */
+                /* Non-NCQ: Read direction の場合はユーザーバッファへコピー */
                 if (!(req.flags & AHCI_CMD_FLAG_WRITE) && req.buffer_len > 0) {
                     if (copy_to_user((void __user *)req.buffer, data_buf, req.buffer_len)) {
                         dev_err(port_dev->device, "Failed to copy result to user\n");
@@ -162,9 +168,13 @@ static long ahci_lld_ioctl(struct file *file, unsigned int cmd,
                     dev_err(port_dev->device, "Failed to copy result fields to user\n");
                     ret = -EFAULT;
                 }
+                
+                /* Non-NCQ: バッファをすぐに解放 */
+                if (data_buf)
+                    kfree(data_buf);
             }
-            
-            /* 同期実行ではバッファをすぐに解放 */
+        } else {
+            /* エラー時はバッファを解放 */
             if (data_buf)
                 kfree(data_buf);
         }
@@ -210,36 +220,39 @@ static long ahci_lld_ioctl(struct file *file, unsigned int cmd,
         
         spin_unlock_irqrestore(&port_dev->slot_lock, flags);
         
-        /* Copy data back to user buffers for READ operations */
-        for (tag = 0; tag < 32; tag++) {
-            if (sdb.completed & (1 << tag)) {
-                struct ahci_cmd_slot *slot = &port_dev->slots[tag];
-                
-                /* Skip if WRITE or no buffer */
-                if (slot->is_write || !slot->buffer || slot->buffer_len == 0)
-                    continue;
-                
-                /* Copy from kernel buffer to user buffer */
-                if (copy_to_user((void __user *)slot->req.buffer, 
-                                 slot->buffer, slot->buffer_len)) {
-                    dev_err(port_dev->device, "Failed to copy data to user for slot %d\n", tag);
-                    sdb.status[tag] = 0xFF;  /* Mark error */
-                    sdb.error[tag] = 0xFF;
-                }
-                
-                /* Free kernel buffer after copy */
-                kfree(slot->buffer);
-                slot->buffer = NULL;
-            }
-        }
-        
-        /* Copy result to user space */
+        /* Copy result to user space (status/error only) */
         if (copy_to_user((void __user *)arg, &sdb, sizeof(sdb))) {
             dev_err(port_dev->device, "Failed to copy SDB to user\n");
             ret = -EFAULT;
         } else {
             ret = 0;
         }
+        break;
+    }
+    
+    /* Free Command Slot */
+    case AHCI_IOC_FREE_SLOT:
+    {
+        int slot;
+        
+        if (get_user(slot, (int __user *)arg)) {
+            ret = -EFAULT;
+            break;
+        }
+        
+        dev_dbg(port_dev->device, "IOCTL: Free Slot %d\n", slot);
+        
+        /* Free slot's buffer if exists */
+        if (slot >= 0 && slot < 32) {
+            struct ahci_cmd_slot *cmd_slot = &port_dev->slots[slot];
+            if (cmd_slot->buffer) {
+                kfree(cmd_slot->buffer);
+                cmd_slot->buffer = NULL;
+            }
+        }
+        
+        ahci_free_slot(port_dev, slot);
+        ret = 0;
         break;
     }
     
