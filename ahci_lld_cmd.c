@@ -244,26 +244,6 @@ int ahci_port_issue_cmd(struct ahci_port_device *port,
 EXPORT_SYMBOL_GPL(ahci_port_issue_cmd);
 
 /**
- * ahci_port_issue_identify - IDENTIFY DEVICE コマンドを発行 (互換性のため残す)
- */
-int ahci_port_issue_identify(struct ahci_port_device *port, void *buf)
-{
-    struct ahci_cmd_request req = {
-        .command = ATA_CMD_IDENTIFY_DEVICE,
-        .features = 0,
-        .device = 0,
-        .lba = 0,
-        .count = 0,
-        .flags = 0,
-        .buffer_len = 512,
-        .timeout_ms = 5000,
-    };
-    
-    return ahci_port_issue_cmd(port, &req, buf);
-}
-EXPORT_SYMBOL_GPL(ahci_port_issue_identify);
-
-/**
  * ahci_port_issue_cmd_async - Issue ATA command asynchronously (NCQ)
  * @port: Port device structure
  * @req: Command request structure (input/output)

@@ -406,46 +406,6 @@ if (ret) {
 
 ---
 
-### ahci_port_issue_identify
-
-**宣言:**
-```c
-int ahci_port_issue_identify(struct ahci_port_device *port, void *buf);
-```
-
-**目的:** IDENTIFY DEVICEコマンドの便利ラッパー
-
-**パラメータ:**
-- `port`: ポートデバイス構造体ポインタ
-- `buf`: 512バイトバッファ（IDENTIFY結果格納）
-
-**動作:**
-1. `ahci_cmd_request`構造体を準備
-   - command = 0xEC (IDENTIFY DEVICE)
-   - device = 0x40
-   - count = 1
-   - timeout = 5000ms
-2. `ahci_port_issue_cmd()`を呼び出し
-
-**戻り値:**
-- `0`: 成功
-- その他: `ahci_port_issue_cmd()`のエラーコード
-
-**使用例:**
-```c
-uint8_t identify_data[512];
-ret = ahci_port_issue_identify(port, identify_data);
-if (ret == 0) {
-    /* Parse IDENTIFY data */
-    uint16_t *words = (uint16_t *)identify_data;
-    bool ncq_supported = !!(words[76] & (1 << 8));
-}
-```
-
-**呼び出し元:** デバイス初期化、診断
-
----
-
 ### ahci_port_issue_cmd_async
 
 **宣言:**

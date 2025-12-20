@@ -160,7 +160,6 @@ int ahci_port_ensure_sg_buffers(struct ahci_port_device *port, int needed);
 /* ahci_lld_cmd.c からエクスポートされるコマンド実行関数 */
 int ahci_port_issue_cmd(struct ahci_port_device *port, 
                         struct ahci_cmd_request *req, void *buf);
-int ahci_port_issue_identify(struct ahci_port_device *port, void *buf);
 int ahci_port_issue_cmd_async(struct ahci_port_device *port,
                                struct ahci_cmd_request *req, void *buf);
 
