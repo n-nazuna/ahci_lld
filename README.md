@@ -405,6 +405,34 @@ GRUB_CMDLINE_LINUX="ahci.ignore_sss=1"
 
 GPL v2
 
+## 詳細ドキュメント
+
+包括的な技術仕様は `doc/` ディレクトリを参照してください：
+
+1. **[IOCTL仕様書](doc/01_IOCTL_SPECIFICATION.md)** - ユーザー空間インターフェース
+   - 全IOCTLコマンドの詳細
+   - データ構造定義
+   - 使用例とエラーコード
+
+2. **[AHCIハードウェア仕様書](doc/02_AHCI_HARDWARE_SPECIFICATION.md)** - レジスタとFIS
+   - GHC/ポートレジスタ定義
+   - FIS構造体（H2D, D2H, SDB等）
+   - 制御シーケンスとDMAレイアウト
+
+3. **[関数API仕様書](doc/03_FUNCTION_API_SPECIFICATION.md)** - 内部カーネル関数
+   - HBA/ポート/コマンド/スロット管理API
+   - 全関数のシグネチャと使用例
+
+4. **[動作フロー仕様書](doc/04_OPERATION_FLOW_SPECIFICATION.md)** - 処理フロー
+   - 初期化シーケンス
+   - 同期/非同期コマンド実行フロー
+   - エラーハンドリングとバッファ管理
+
+5. **[NCQユーザーガイド](doc/05_NCQ_USER_GUIDE.md)** - NCQ機能の使い方
+   - NCQの概要とメリット
+   - 基本的な使い方と複数コマンド並列実行
+   - パフォーマンス最適化とトラブルシューティング
+
 ## 参考仕様
 
 - **AHCI Specification**: Revision 1.3.1
@@ -416,6 +444,13 @@ GPL v2
 n-nazuna
 
 ## 変更履歴
+
+- **2025-12-20**: NCQ実装と包括的ドキュメント整備
+  - Native Command Queuing (NCQ) 完全対応
+  - READ/WRITE FPDMA QUEUED コマンド実装
+  - 非同期コマンド実行（最大32並列）
+  - SDB FIS完了通知対応
+  - 包括的な技術仕様書を `doc/` に整理
 
 - **2025-12-07**: 初版リリース
   - ATAコマンド発行機能実装
